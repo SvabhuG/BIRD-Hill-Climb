@@ -1,0 +1,18 @@
+[project]
+name = "bird-climb"
+version = "0.1.0"
+description = "Hill-climbing on BIRD text-to-SQL dev set"
+requires-python = ">=3.11"
+dependencies = [
+    "modal>=0.74",
+    "tqdm",
+    "pydantic>=2",
+    "sqlglot>=25",
+]
+
+[tool.setuptools.packages.find]
+include = ["bird*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
