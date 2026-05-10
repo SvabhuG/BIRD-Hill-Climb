@@ -69,6 +69,100 @@ def build_messages(example: BirdExample, schema: DatabaseSchema, n_samples: int 
     ]
 
 
+# Keep total user content under this many chars when adding shots. 12k chars
+# is a comfortable budget for a 16k-token context window since each shot's
+# question + SQL is short relative to the schema block.
+_FEWSHOT_CHAR_BUDGET = 12_000
+
+
+def _format_shot(idx: int, shot: BirdExample) -> str:
+    """Render a single retrieved demo. Compact format — schema is shared."""
+    hint = shot.evidence.strip() or "(none provided)"
+    sql = shot.sql.strip().rstrip(";") + ";"
+    return (
+        f"### Example {idx}\n"
+        f"Question: {shot.question.strip()}\n"
+        f"Hint: {hint}\n"
+        f"SQL:\n```sql\n{sql}\n```"
+    )
+
+
+def build_messages_with_fewshot(
+    example: BirdExample,
+    schema: DatabaseSchema,
+    shots: list[BirdExample],
+    n_samples: int = 3,
+) -> list[dict]:
+    """Like `build_messages`, but interleaves retrieved demos before the question.
+
+    Layout (single user message):
+        ### Database schema (SQLite)
+        ```sql ... ```
+
+        ### Examples
+        ### Example 1
+        Question: ...
+        Hint: ...
+        SQL: ```sql ... ```
+        ### Example 2
+        ...
+
+        ### External knowledge / hint
+        <evidence>
+
+        ### Question
+        <question>
+
+        ### Output
+        ...
+
+    Token-budget guard: we drop trailing shots whose inclusion would push the
+    user content past `_FEWSHOT_CHAR_BUDGET` chars. Earlier shots win; they're
+    already ranked by relevance.
+    """
+    schema_block = render_ddl_with_samples(schema, n_samples=n_samples).strip()
+    evidence = example.evidence.strip() or "(none provided)"
+
+    # Build base user content (without examples block) so we can compute the
+    # remaining budget for shots.
+    base_user = USER_TEMPLATE.format(
+        schema_block=schema_block,
+        evidence=evidence,
+        question=example.question.strip(),
+    )
+
+    # Reserve a small overhead for the "### Examples\n\n" separator + spacing.
+    overhead = 32
+    remaining = max(_FEWSHOT_CHAR_BUDGET - len(base_user) - overhead, 0)
+
+    rendered_shots: list[str] = []
+    used = 0
+    for i, shot in enumerate(shots, start=1):
+        block = _format_shot(i, shot)
+        # +2 for the "\n\n" join between shots
+        cost = len(block) + (2 if rendered_shots else 0)
+        if used + cost > remaining:
+            # Skip this shot rather than truncate its SQL — a half-SQL example
+            # would be actively misleading to the model.
+            continue
+        rendered_shots.append(block)
+        used += cost
+
+    if rendered_shots:
+        examples_block = "### Examples\n" + "\n\n".join(rendered_shots) + "\n"
+        # Splice the examples block immediately before "### External knowledge / hint".
+        marker = "### External knowledge / hint"
+        idx = base_user.index(marker)
+        user = base_user[:idx] + examples_block + "\n" + base_user[idx:]
+    else:
+        user = base_user
+
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user},
+    ]
+
+
 _FENCE_RE = re.compile(r"```(?:sql|sqlite)?\s*\n?(.*?)```", re.IGNORECASE | re.DOTALL)
 
 

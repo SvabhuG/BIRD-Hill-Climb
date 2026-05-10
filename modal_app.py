@@ -55,22 +55,55 @@ cpu_image = (
 )
 
 # GPU image used by the vLLM engine.
+#
+# Pin rationale (May 2026):
+#   * Qwen3.6-27B (model_type `qwen3_5`, arch `Qwen3_5ForConditionalGeneration`)
+#     ships against transformers 5.x. vllm 0.19.0 originally pinned
+#     `transformers<5,>=4.56.0` (vllm-project/vllm#39216) which excluded the new
+#     architecture. vllm 0.20.2 relaxes that to allow transformers 5.5.1+
+#     (`transformers!=5.0.*..!=5.5.0,>=4.56.0`).
+#   * vllm 0.20.2 still supports the older Qwen2.5-Coder / Qwen3-Coder models
+#     we use, so this is an additive bump (no regression for prior baselines).
+#   * transformers 5.8.0 is the current latest and is the version the Qwen3.6
+#     model card recommends ("latest transformers required").
+#   * Old combo (vllm==0.11.0 + transformers==4.57.0) failed engine init with
+#     "checkpoint has model type `qwen3_5` but Transformers does not recognize
+#     this architecture". Going forward — never pair vllm<0.20 with
+#     transformers>=5, that triggers the Qwen2Tokenizer.all_special_tokens_extended
+#     attribute error (memory note feedback_vllm_transformers_pinning.md).
+#   * vllm 0.20.2 pulls in flashinfer 0.6.8 which (when used as the attention
+#     backend) JIT-compiles trtllm fmha kernels at engine-init time. That JIT
+#     needs both nvcc *and* the CCCL `nv/target` header, neither of which ships
+#     with the torch 2.11.0 wheel. We sidestep the JIT entirely by forcing the
+#     `FLASH_ATTN` attention backend (also auto-detected as available on B200,
+#     and doesn't need any JIT compile). This is the recommended workaround per
+#     flashinfer-ai/flashinfer#1919 / vllm-project/vllm#26642 when nvcc/CCCL
+#     can't be made available — and it's what we want anyway since FLASH_ATTN
+#     has stable kernels and avoids first-call latency.
 gpu_image = (
     modal.Image.debian_slim(python_version=_PY)
     .apt_install("git")
-    # Known-working combo for the Qwen2Tokenizer.all_special_tokens_extended
-    # incompatibility (verl-project/verl#4337, QwenLM/Qwen3-VL#2058,
-    # rllm-org/rllm#388). Older vllm + newer transformers, OR newer vllm + older
-    # transformers, both break — only this paired version works.
     .pip_install(
-        "vllm==0.11.0",
-        "transformers==4.57.0",
+        "vllm==0.20.2",
+        "transformers==5.8.0",
         "tqdm",
         "pydantic>=2",
         "sqlglot>=25",
         "huggingface_hub",
     )
-    .env({"HF_HOME": HF_HOME, "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({
+        "HF_HOME": HF_HOME,
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        # Qwen3.6's gated-delta-net layers trigger vllm's FP8 fused MoE path
+        # which calls DeepGEMM for E8M0-scaled GEMMs. The DeepGEMM backend
+        # isn't bundled with the vllm wheel and JIT-builds it (and even when
+        # available has accuracy issues on Blackwell — vllm-project/vllm#37804,
+        # vllm-project/vllm#21562). The model itself is bf16, so we don't
+        # actually need FP8 kernels — disable the path entirely and let vllm
+        # fall back to the Triton FP8/bf16 kernels.
+        "VLLM_USE_DEEP_GEMM": "0",
+        "VLLM_USE_DEEP_GEMM_E8M0": "0",
+    })
     .pip_install("hf_transfer")
     .add_local_python_source("bird")
 )
@@ -225,6 +258,10 @@ class Inference:
     model_name: str = modal.parameter(default="Qwen/Qwen2.5-Coder-7B-Instruct")
     tensor_parallel_size: int = modal.parameter(default=1)
     max_model_len: int = modal.parameter(default=16384)
+    # FLASH_ATTN ships as a pre-built kernel and avoids flashinfer's JIT-compile
+    # step (which needs nvcc + CCCL headers we don't ship in the image). Empty
+    # string => let vLLM auto-pick.
+    attention_backend: str = modal.parameter(default="FLASH_ATTN")
 
     @modal.enter()
     def _load(self):
@@ -237,6 +274,7 @@ class Inference:
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             download_dir=HF_HOME,
+            attention_backend=self.attention_backend or None,
         )
         print(f"[inference] loaded {self.model_name} in {time.time() - t0:.1f}s")
 
@@ -296,8 +334,14 @@ def evaluate_predictions(
     timeout_s: float = 30.0,
     workers: int = 8,
     save_as: str | None = None,
+    return_full: bool = False,
 ) -> dict:
-    """Run execution-accuracy on a list of predictions, return summary + per-row results."""
+    """Run execution-accuracy on a list of predictions, return summary + per-row results.
+
+    `return_full=True` returns the full per-question payload inline (used by the
+    self-correction orchestrator to filter exec_error cases without a volume
+    round-trip). Default is the slim summary, preserving existing callers.
+    """
     from bird.eval import (
         evaluate_predictions as _eval_pred,
         format_summary,
@@ -359,11 +403,14 @@ def evaluate_predictions(
         print(f"[eval] wrote {out}")
 
     # Return a slim summary; full results are on the volume if save_as was set.
-    return {
+    slim = {
         "split": split, "n": summary.n, "n_correct": summary.n_correct,
         "ex": summary.ex, "by_status": summary.by_status,
         "by_difficulty": summary.by_difficulty, "saved": save_as,
     }
+    if return_full:
+        slim["results"] = payload["results"]
+    return slim
 
 
 # ============================================================
@@ -598,5 +645,636 @@ def run_with_linking(
     summary = evaluate_predictions.remote(split=split, predictions=predictions, save_as=save_tag)
     summary["linking_recall_avg"] = avg_recall
     summary["linking_recall_perfect"] = perfect
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+# ============================================================
+# Voting (CPU, parallel processes) + orchestrator
+# ============================================================
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    cpu=8,
+    timeout=60 * 30,
+)
+def vote_predictions(
+    split: str,
+    candidate_lists: list[list[str]],
+    metas: list[dict],
+    timeout_s: float = 15.0,
+    workers: int = 8,
+) -> list[dict]:
+    """Majority-vote-on-execution per question.
+
+    For each question, executes its candidate SQLs against the question's SQLite DB,
+    hashes each result-set, and returns the SQL whose result is the most common.
+    Returns a list aligned with `metas`: [{question_id, winner_sql, voting_metadata}].
+    """
+    import multiprocessing as mp
+
+    split_root = Path(BIRD_ROOT) / split
+    db_dir = split_root / f"{split}_databases"
+
+    # Pack work items so we can fan out to a process pool. We carry the question_id
+    # so results can be reassembled in caller order.
+    jobs: list[tuple[int, str, list[str], str, float]] = []
+    for cand_list, meta in zip(candidate_lists, metas):
+        db_path = str(db_dir / meta["db_id"] / f'{meta["db_id"]}.sqlite')
+        jobs.append((meta["question_id"], meta["db_id"], list(cand_list), db_path, timeout_s))
+
+    t0 = time.time()
+    if workers <= 1:
+        results = [_vote_worker(j) for j in jobs]
+    else:
+        # `vote` is CPU-bound (SQLite execution + hashing) — use processes for true
+        # parallelism, mirroring `evaluate_predictions`.
+        with mp.get_context("spawn").Pool(workers) as pool:
+            results = list(pool.imap(_vote_worker, jobs, chunksize=4))
+    print(f"[vote] voted on {len(results)} questions in {time.time() - t0:.1f}s")
+    return results
+
+
+def _vote_worker(job):
+    """Module-level worker so the spawn-context pool can pickle it."""
+    from bird.voting import vote
+    qid, db_id, cands, db_path, t = job
+    outcome = vote(cands, db_path, timeout_s=t)
+    return {
+        "question_id": qid,
+        "db_id": db_id,
+        "winner_sql": outcome["winner_sql"],
+        "voting_metadata": {
+            "winner_count": outcome["winner_count"],
+            "n_candidates": outcome["n_candidates"],
+            "n_executable": outcome["n_executable"],
+            "n_distinct_results": outcome["n_distinct_results"],
+            "fallback_used": outcome["fallback_used"],
+        },
+    }
+
+
+@app.local_entrypoint()
+def run_with_voting(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    n_samples_schema: int = 3,
+    n_votes: int = 8,
+    temperature: float = 0.6,
+    max_tokens: int = 1024,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+    vote_timeout_s: float = 15.0,
+    eval_timeout_s: float = 30.0,
+):
+    """Self-consistency by majority-vote-on-execution.
+
+    Per question, sample n_votes candidates at temperature>0, execute each on the
+    SQLite DB, group by canonical result-set hash, and pick the SQL whose result
+    is the most common among executable candidates. Falls back to the first
+    candidate if every sample fails to execute.
+    """
+    print(f"[orchestrator] preparing prompts for split={split}, limit={limit or 'all'}")
+    convos, examples_meta = _prepare_local.remote(split, limit, n_samples_schema)
+
+    print(f"[orchestrator] {len(convos)} prompts; sampling n={n_votes} @ T={temperature} on {model}")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    raw = inf.chat.remote(
+        convos, n=n_votes, temperature=temperature, max_tokens=max_tokens,
+    )
+
+    # Extract SQL from each completion -> per-question candidate lists.
+    candidate_lists: list[list[str]] = []
+    raw_completions: list[list[str]] = []
+    for gens in raw:
+        gens = gens or []
+        raw_completions.append(gens)
+        candidate_lists.append([extract_sql(g) for g in gens])
+
+    print(f"[orchestrator] running per-question vote (timeout={vote_timeout_s}s)")
+    voted = vote_predictions.remote(
+        split=split,
+        candidate_lists=candidate_lists,
+        metas=examples_meta,
+        timeout_s=vote_timeout_s,
+    )
+
+    # Build the predictions list, attaching voting_metadata as a passthrough field.
+    by_qid = {v["question_id"]: v for v in voted}
+    predictions = []
+    n_fallback = 0
+    for meta, gens, cands in zip(examples_meta, raw_completions, candidate_lists):
+        v = by_qid[meta["question_id"]]
+        if v["voting_metadata"]["fallback_used"]:
+            n_fallback += 1
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": v["winner_sql"],
+            "raw_completions": gens,
+            "candidate_sqls": cands,
+            "voting_metadata": v["voting_metadata"],
+        })
+
+    avg_executable = (
+        sum(p["voting_metadata"]["n_executable"] for p in predictions)
+        / max(len(predictions), 1)
+    )
+    avg_winner_count = (
+        sum(p["voting_metadata"]["winner_count"] for p in predictions)
+        / max(len(predictions), 1)
+    )
+    print(
+        f"[vote] avg_executable={avg_executable:.2f}/{n_votes}  "
+        f"avg_winner_count={avg_winner_count:.2f}  fallback={n_fallback}/{len(predictions)}"
+    )
+
+    save_tag = save_as or f"voting-{Path(model).name}-{split}-n{n_votes}-{int(time.time())}.json"
+    print("[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag, timeout_s=eval_timeout_s,
+    )
+    summary["voting"] = {
+        "n_votes": n_votes,
+        "temperature": temperature,
+        "avg_executable": avg_executable,
+        "avg_winner_count": avg_winner_count,
+        "n_fallback": n_fallback,
+    }
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+# ============================================================
+# Self-correction orchestrator
+# ============================================================
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 10,
+)
+def _prepare_for_correction(
+    split: str,
+    items: list[dict],   # [{question_id, db_id, question, evidence, difficulty, failed_sql, error}]
+    n_samples: int,
+):
+    """Build correction-prompt messages for a list of exec_error questions.
+
+    Why a Modal function: schemas live on the bird-data volume. Loading them on
+    the local CLI side would either need a mount (we don't) or duplicate work.
+    Cache schemas by db_id within the call — exec_error sets are usually small
+    and concentrated on a handful of databases.
+    """
+    from bird.correction import build_correction_messages
+    from bird.data import BirdExample, load_split
+    from bird.schema import extract_schema
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    schema_cache: dict[str, object] = {}
+    msgs: list[list[dict]] = []
+    for it in items:
+        db_id = it["db_id"]
+        if db_id not in schema_cache:
+            schema_cache[db_id] = extract_schema(sp.db_path(db_id), db_id, n_samples=n_samples)
+        ex = BirdExample(
+            question_id=it["question_id"],
+            db_id=db_id,
+            question=it["question"],
+            evidence=it.get("evidence", "") or "",
+            sql="",
+            difficulty=it.get("difficulty"),
+        )
+        msgs.append(
+            build_correction_messages(
+                ex, schema_cache[db_id],
+                failed_sql=it.get("failed_sql", "") or "",
+                error_msg=it.get("error", "") or "",
+                n_samples=n_samples,
+            )
+        )
+    return msgs
+
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 10,
+)
+def _load_question_meta(split: str, limit: int) -> list[dict]:
+    """Return the question/evidence text for each example in the split.
+
+    `_prepare_local` doesn't include question/evidence in its meta payload (the
+    baseline doesn't need them after prompts are built). The correction loop
+    needs them by question_id to build retry prompts.
+    """
+    from bird.data import load_split
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    examples = sp.examples[:limit] if limit else sp.examples
+    return [
+        {
+            "question_id": ex.question_id,
+            "question": ex.question,
+            "evidence": ex.evidence,
+        }
+        for ex in examples
+    ]
+
+
+@app.local_entrypoint()
+def run_with_correction(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    n_samples: int = 3,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    retry_temperature: float = 0.2,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """Greedy first pass + self-correction retry on every exec_error case.
+
+    Two inference passes: the first pass mirrors run_baseline. We then evaluate
+    in-place (return_full=True so we don't need a volume round-trip), filter to
+    questions whose status is `exec_error`, build correction prompts (schema +
+    question + failed SQL + error), and run a second inference pass at a
+    slightly elevated temperature. The retried predictions overwrite the
+    failed ones; everything else stays as-is. We re-evaluate the merged set
+    and save that as the final result.
+
+    Note: we deliberately don't retry `wrong` cases — there's no signal that
+    the SQL is wrong (it ran, it returned rows). The model would pick the same
+    answer again. Only `exec_error` carries explicit feedback the model can use.
+    """
+    print(f"[orchestrator] preparing prompts for split={split}, limit={limit or 'all'}")
+    convos, examples_meta = _prepare_local.remote(split, limit, n_samples)
+
+    print(f"[orchestrator] {len(convos)} prompts; first-pass inference on {model} "
+          f"(tp={tensor_parallel_size})")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    raw = inf.chat.remote(convos, n=1, temperature=temperature, max_tokens=max_tokens)
+
+    predictions: list[dict] = []
+    for meta, gens in zip(examples_meta, raw):
+        text = gens[0] if gens else ""
+        sql = extract_sql(text)
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": sql,
+            "raw_completion": text,
+        })
+
+    # First-pass eval: full per-row results inline so we can filter to exec_error
+    # without a volume read. save_as=None — we only want the final, merged result on disk.
+    print("[orchestrator] first-pass eval (in-memory)")
+    first = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=None, return_full=True,
+    )
+    first_status_counts = first.get("by_status", {})
+    print(f"[first-pass] EX={first.get('ex'):.4f} by_status={first_status_counts}")
+
+    # Pull question text by id (correction prompts need it; the original meta dropped it).
+    qmeta = _load_question_meta.remote(split=split, limit=limit)
+    qmeta_by_id = {m["question_id"]: m for m in qmeta}
+
+    full_results: list[dict] = first["results"]
+    exec_error_idxs = [i for i, r in enumerate(full_results) if r.get("status") == "exec_error"]
+    n_exec_err_before = len(exec_error_idxs)
+    print(f"[correction] {n_exec_err_before} exec_error cases to retry")
+
+    if not exec_error_idxs:
+        print("[correction] nothing to retry; saving first-pass result as final")
+        save_tag = save_as or f"correction-{Path(model).name}-{split}-{int(time.time())}.json"
+        evaluate_predictions.remote(
+            split=split, predictions=predictions, save_as=save_tag,
+        )
+        print(f"[done] saved as {save_tag} on bird-results volume")
+        return
+
+    # Build correction prompts for the failed indices.
+    correction_items = []
+    for i in exec_error_idxs:
+        r = full_results[i]
+        qm = qmeta_by_id.get(r["question_id"], {})
+        correction_items.append({
+            "question_id": r["question_id"],
+            "db_id": r["db_id"],
+            "difficulty": r.get("difficulty"),
+            "question": qm.get("question", ""),
+            "evidence": qm.get("evidence", ""),
+            "failed_sql": r.get("predicted_sql", ""),
+            "error": r.get("error", ""),
+        })
+
+    print(f"[orchestrator] building {len(correction_items)} correction prompts")
+    correction_msgs = _prepare_for_correction.remote(split, correction_items, n_samples)
+
+    print(f"[orchestrator] retry inference (temperature={retry_temperature})")
+    retry_raw = inf.chat.remote(
+        correction_msgs, n=1, temperature=retry_temperature, max_tokens=max_tokens,
+    )
+
+    # Replace failed predictions with retried SQL; track corrected_from for audit.
+    for idx, gens in zip(exec_error_idxs, retry_raw):
+        text = gens[0] if gens else ""
+        new_sql = extract_sql(text)
+        prev = predictions[idx]
+        original_failed = prev.get("predicted_sql", "")
+        original_error = full_results[idx].get("error", "")
+        # If the model produced no SQL or the same SQL, leave the original in place
+        # but still record what we tried — re-eval will reproduce the original status.
+        prev["corrected_from"] = {"sql": original_failed, "error": original_error}
+        prev["correction_raw_completion"] = text
+        if new_sql and new_sql.strip() and new_sql.strip() != original_failed.strip():
+            prev["predicted_sql"] = new_sql
+
+    save_tag = save_as or f"correction-{Path(model).name}-{split}-{int(time.time())}.json"
+    print("[orchestrator] re-running execution evaluator on merged predictions")
+    final = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag, return_full=True,
+    )
+
+    # Tally how the retried questions ended up.
+    retry_outcome: dict[str, int] = {}
+    final_results = final.get("results", [])
+    final_by_id = {r["question_id"]: r for r in final_results}
+    for it in correction_items:
+        r = final_by_id.get(it["question_id"], {})
+        retry_outcome[r.get("status", "missing")] = retry_outcome.get(r.get("status", "missing"), 0) + 1
+
+    print(f"[correction] before: {n_exec_err_before} exec_errors")
+    print(f"[correction] retry outcomes: {retry_outcome}")
+    final.pop("results", None)  # don't dump the whole payload to stdout
+    print(json.dumps(final, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+# ============================================================
+# CoT (plan-then-SQL) orchestrator
+# ============================================================
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 10,
+)
+def _prepare_for_cot(split: str, limit: int, n_samples: int):
+    """Build stage-1 (plan) prompts + per-DB schemas + per-question metadata.
+
+    Mirrors `_prepare_for_linking`: schemas are returned as a unique-by-db_id
+    dict so we can rebuild stage-2 (SQL-from-plan) prompts locally without
+    re-extracting schemas. Stage-2 prompts depend on the model's stage-1
+    output, so we can't pre-build them here.
+    """
+    from bird.cot import build_plan_messages
+    from bird.data import load_split
+    from bird.schema import extract_schema
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    examples = sp.examples[:limit] if limit else sp.examples
+
+    schemas: dict[str, object] = {}
+    plan_msgs: list[list[dict]] = []
+    metas: list[dict] = []
+    for ex in examples:
+        if ex.db_id not in schemas:
+            schemas[ex.db_id] = extract_schema(sp.db_path(ex.db_id), ex.db_id, n_samples=n_samples)
+        plan_msgs.append(build_plan_messages(ex, schemas[ex.db_id], n_samples=n_samples))
+        metas.append({
+            "question_id": ex.question_id,
+            "db_id": ex.db_id,
+            "question": ex.question,
+            "evidence": ex.evidence,
+            "difficulty": ex.difficulty,
+            "gold_sql": ex.sql,
+        })
+    return plan_msgs, schemas, metas
+
+
+@app.local_entrypoint()
+def run_with_cot(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    n_samples: int = 3,
+    plan_max_tokens: int = 384,
+    sql_max_tokens: int = 1024,
+    plan_temperature: float = 0.3,
+    sql_temperature: float = 0.0,
+    save_as: str = "",
+):
+    """Two-stage plan-then-SQL chain-of-thought.
+
+    Stage 1: ask the model for a 3-6 sentence natural-language plan describing
+             which tables/columns/filters/aggregations to use.
+    Stage 2: feed the plan back in alongside the same schema/question/evidence
+             and ask for the SQL.
+
+    Two forward passes per question. Plan is captured on each prediction as a
+    passthrough field so failures can be inspected: bad plan vs. good plan that
+    the SQL stage failed to follow are very different bugs.
+    """
+    # CoT-only deps: imported here so `run_baseline` and `run_with_linking`
+    # don't need them in the local CLI's Python.
+    from bird.cot import build_sql_with_plan_messages, extract_plan
+    from bird.data import BirdExample
+
+    print(f"[orchestrator] preparing CoT plan prompts for split={split}, limit={limit or 'all'}")
+    plan_msgs, schemas, metas = _prepare_for_cot.remote(split, limit, n_samples)
+
+    print(f"[orchestrator] {len(plan_msgs)} questions; stage-1 plan pass on {model} "
+          f"(temp={plan_temperature}, max_tokens={plan_max_tokens})")
+    inf = Inference(model_name=model)
+    plan_outs = inf.chat.remote(
+        plan_msgs, n=1, temperature=plan_temperature, max_tokens=plan_max_tokens,
+    )
+
+    print("[orchestrator] extracting plans + building stage-2 SQL prompts")
+    plans: list[str] = []
+    sql_msgs: list[list[dict]] = []
+    for raw, meta in zip(plan_outs, metas):
+        plan_text = extract_plan(raw[0] if raw else "")
+        plans.append(plan_text)
+        ex = BirdExample(
+            question_id=meta["question_id"], db_id=meta["db_id"],
+            question=meta["question"], evidence=meta["evidence"],
+            sql="", difficulty=meta["difficulty"],
+        )
+        sql_msgs.append(
+            build_sql_with_plan_messages(ex, schemas[meta["db_id"]], plan_text, n_samples=n_samples)
+        )
+
+    n_empty_plans = sum(1 for p in plans if not p)
+    print(f"[cot] stage-1 produced {len(plans) - n_empty_plans} plans "
+          f"({n_empty_plans} empty / fell back to plain SQL gen)")
+
+    print(f"[orchestrator] stage-2 SQL pass on {model} "
+          f"(temp={sql_temperature}, max_tokens={sql_max_tokens})")
+    sql_outs = inf.chat.remote(
+        sql_msgs, n=1, temperature=sql_temperature, max_tokens=sql_max_tokens,
+    )
+
+    predictions = []
+    for meta, gens, plan_text in zip(metas, sql_outs, plans):
+        text = gens[0] if gens else ""
+        sql = extract_sql(text)
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": sql,
+            "raw_completion": text,
+            "plan": plan_text,
+        })
+
+    save_tag = save_as or f"cot-{Path(model).name}-{split}-{int(time.time())}.json"
+    print("[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(split=split, predictions=predictions, save_as=save_tag)
+    summary["n_empty_plans"] = n_empty_plans
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+# ============================================================
+# Few-shot orchestrator
+# ============================================================
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 15,
+)
+def _prepare_with_fewshot(split: str, limit: int, n_samples: int, k_shots: int):
+    """Build (messages, meta) pairs with retrieved few-shot examples from BIRD train.
+
+    Loads BIRD train once, builds a TrainIndex, then for each dev example
+    retrieves k same-db (with cross-db fallback) shots ranked by Jaccard
+    overlap on the question and renders them via `build_messages_with_fewshot`.
+
+    Returns the same (convos, metas) shape as `_prepare_local`.
+
+    Requires `/data/bird/train/train.json` to be present on the bird-data
+    volume. Run `modal run modal_app.py::download_bird --splits train` first.
+    """
+    from bird.data import load_split
+    from bird.fewshot import load_train_index, retrieve
+    from bird.prompts import build_messages_with_fewshot
+    from bird.schema import extract_schema
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    examples = sp.examples[:limit] if limit else sp.examples
+
+    train_root = Path(BIRD_ROOT) / "train"
+    if not (train_root / "train.json").exists():
+        raise FileNotFoundError(
+            f"BIRD train not found at {train_root}/train.json. "
+            "Run `modal run modal_app.py::download_bird --splits train` first."
+        )
+    print(f"[fewshot-prep] loading train index from {train_root}")
+    train = load_train_index(train_root)
+    print(f"[fewshot-prep] {len(train.examples)} train examples across "
+          f"{len(train.by_db_id)} db_ids")
+
+    schema_cache: dict[str, object] = {}
+    convos: list[list[dict]] = []
+    metas: list[dict] = []
+    for ex in examples:
+        if ex.db_id not in schema_cache:
+            schema_cache[ex.db_id] = extract_schema(
+                sp.db_path(ex.db_id), ex.db_id, n_samples=n_samples,
+            )
+        shots = retrieve(ex.question, ex.db_id, train, k=k_shots)
+        msgs = build_messages_with_fewshot(
+            ex, schema_cache[ex.db_id], shots, n_samples=n_samples,
+        )
+        convos.append(msgs)
+        metas.append({
+            "question_id": ex.question_id,
+            "db_id": ex.db_id,
+            "difficulty": ex.difficulty,
+            "gold_sql": ex.sql,
+            "fewshot_qids": [s.question_id for s in shots],
+            "fewshot_db_ids": [s.db_id for s in shots],
+        })
+    return convos, metas
+
+
+@app.local_entrypoint()
+def run_with_fewshot(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    k_shots: int = 4,
+    n_samples: int = 3,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    save_as: str = "",
+    base_model: bool = False,
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """Greedy run with k retrieved few-shot demos from BIRD train.
+
+    Prerequisite: BIRD train must already be on the bird-data Modal volume at
+    `/data/bird/train/train.json` and `/data/bird/train/train_databases/`.
+    If not, run `modal run modal_app.py::download_bird --splits train` first.
+    """
+    print(f"[orchestrator] preparing few-shot prompts for split={split}, "
+          f"limit={limit or 'all'}, k_shots={k_shots}")
+    convos, examples_meta = _prepare_with_fewshot.remote(split, limit, n_samples, k_shots)
+
+    print(f"[orchestrator] {len(convos)} prompts prepared; running inference on {model} "
+          f"(base_model={base_model}, tp={tensor_parallel_size})")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    save_tag = save_as or f"fewshot-k{k_shots}-{Path(model).name}-{split}-{int(time.time())}.json"
+    if base_model:
+        raw_prompts = [messages_to_raw_text(c) for c in convos]
+        raw = inf.complete.remote(raw_prompts, n=1, temperature=temperature, max_tokens=max_tokens)
+    else:
+        raw = inf.chat.remote(convos, n=1, temperature=temperature, max_tokens=max_tokens)
+
+    predictions = []
+    for meta, gens in zip(examples_meta, raw):
+        text = gens[0] if gens else ""
+        sql = extract_sql(text)
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": sql,
+            "raw_completion": text,
+            "fewshot_qids": meta.get("fewshot_qids", []),
+            "fewshot_db_ids": meta.get("fewshot_db_ids", []),
+        })
+
+    print(f"[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag,
+    )
     print(json.dumps(summary, indent=2))
     print(f"[done] saved as {save_tag} on bird-results volume")
