@@ -1,0 +1,111 @@
+# ============================================================================
+# BIRD execution-reward GRPO — Qwen2.5-Coder-32B-Instruct (FALLBACK recipe)
+# ============================================================================
+#
+# Use this config ONLY if `grpo_config.toml` (Qwen3-Coder-30B-A3B-Instruct)
+# fails to load through prime-rl's qwen3_moe path. Failure modes that
+# motivate the swap:
+#   * trainer.model.impl="custom" rejects the HF config (architecture
+#     not registered as qwen3_moe under that name).
+#   * Expert-parallel weight-loading errors on the 128-expert layout
+#     (`Qwen3-Coder-30B-A3B` has a different expert count than the
+#     supported reference `Qwen3-30B-A3B`).
+#   * vLLM 0.x inference doesn't yet ship a `qwen3_coder_moe` kernel path.
+#
+# Qwen2.5-Coder-32B-Instruct is the *exact* starting checkpoint Arctic-R1
+# used (Snowflake/Arctic-Text2SQL-R1-32B). It's a dense 32B model, no MoE
+# complications — guaranteed to load via prime-rl's HF causal-LM path.
+#
+# Expected ceiling delta: Arctic-R1 published +13pp BIRD dev EX from RL
+# alone over this same base. So replicating their recipe is a known-good
+# fallback.
+#
+# Notable differences from the primary (MoE) config:
+#   * impl = "hf" — vanilla HF causal-LM loading, no custom MoE kernel.
+#   * No `ep` (expert parallelism); use tensor parallelism only.
+#   * LR 1e-6 — Arctic-R1's published value for the 32B dense base.
+# ============================================================================
+
+max_steps = 6000
+seq_len   = 16384
+
+[log]
+level = "info"
+
+[model]
+name = "Qwen/Qwen2.5-Coder-32B-Instruct"
+
+[ckpt]
+interval = 500
+
+[wandb]
+project = "bird-rl"
+name    = "qwen2.5-coder-32b-grpo-arctic-r1-replication"
+
+# ---- Trainer ---------------------------------------------------------------
+
+[trainer.model]
+impl = "hf"                    # Vanilla HF causal-LM. No custom MoE/EP.
+attn  = "flash_attention_3"    # Drop to "flash_attention_2" on Ampere.
+
+[trainer.model.compile]
+
+[trainer.model.ac]
+freq = 1                       # 32B dense at seq_len 16K needs activation checkpointing.
+
+[trainer.optim]
+type = "adamw"
+lr   = 1e-6                    # Arctic-R1's exact value for this base.
+
+# ---- Orchestrator: GRPO ----------------------------------------------------
+
+[orchestrator]
+batch_size            = 256
+rollouts_per_example  = 8       # Arctic-R1 group size.
+oversampling_factor   = 2
+max_off_policy_steps  = 8
+
+[orchestrator.train.sampling]
+max_completion_tokens = 1024
+temperature           = 1.0
+
+[[orchestrator.train.env]]
+id   = "bird-exec"
+name = "bird-exec"
+
+[orchestrator.train.env.args]
+train_root         = "/shared/bird/train"
+split              = "train"
+eval_root          = "/shared/bird/dev"
+eval_split         = "dev"
+num_train_examples = -1
+num_eval_examples  = 200
+n_samples_schema   = 3
+exec_timeout_s     = 15.0
+
+[orchestrator.eval]
+interval = 250
+
+[[orchestrator.eval.env]]
+id = "bird-exec"
+
+[orchestrator.eval.env.args]
+train_root         = "/shared/bird/dev"
+split              = "dev"
+num_train_examples = 200
+n_samples_schema   = 3
+exec_timeout_s     = 15.0
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 1024
+temperature           = 0.0
+
+[orchestrator.buffer]
+easy_threshold = 1.0
+hard_threshold = 0.0
+seed           = 42
+
+# ---- Inference -------------------------------------------------------------
+
+[inference.parallel]
+tp = 8                          # 32B dense fits in 8x B200/H200 with TP=8.

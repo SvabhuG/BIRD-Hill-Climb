@@ -10,6 +10,22 @@ dependencies = [
     "sqlglot>=25",
 ]
 
+[project.optional-dependencies]
+# Prime Intellect RL stack — only needed on the training node and for
+# `python -m scripts.smoke_test_rl_env`'s optional load_environment check.
+# `prime-rl` itself is the trainer (installed separately on the cluster
+# per rl/LAUNCH.md); we only pull in the env library + dataset I/O here.
+rl = [
+    "verifiers>=0.1.14",
+    "datasets>=2.18",
+]
+
+[project.entry-points."verifiers.environments"]
+# Allows `prime env install bird-exec` to auto-discover `load_environment`
+# without a separate env-package directory. Referenced as id = "bird-exec"
+# in the prime-rl rl.toml configs under rl/.
+"bird-exec" = "bird.rl_env:load_environment"
+
 [tool.setuptools.packages.find]
 include = ["bird*"]
 

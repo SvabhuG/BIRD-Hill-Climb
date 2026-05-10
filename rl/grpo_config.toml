@@ -1,0 +1,117 @@
+# ============================================================================
+# BIRD execution-reward GRPO — Qwen3-Coder-30B-A3B-Instruct (primary recipe)
+# ============================================================================
+#
+# Recipe matches Arctic-R1 (Snowflake/Arctic-Text2SQL-R1-32B, +13pp on BIRD dev
+# over its Qwen2.5-Coder-32B base). The exact knobs:
+#   * Online GRPO (NOT batch / offline — Arctic-R1 explicitly says online wins).
+#   * Group size 8 (`rollouts_per_example`).
+#   * Binary execution reward only (no length penalty, no format reward,
+#     no intermediate scoring) — defined in `bird/rl_env.py::compute_reward`.
+#   * LR 5e-7. Arctic-R1 used 1e-6 for the 32B dense base; we go a touch lower
+#     because A3B MoE has ~3B active params per token and tends to be more
+#     sensitive to LR shocks. Bump to 1e-6 if reward variance is healthy at step ~200.
+#   * No KL beyond the GRPO default.
+#
+# Target model: `Qwen/Qwen3-Coder-30B-A3B-Instruct` (qwen3_moe architecture,
+# same family as `Qwen/Qwen3-30B-A3B`, which prime-rl's MoE/EP path
+# explicitly supports — see README "Models support" table).
+#
+# Inference TP / training EP / cluster size: the values below assume one
+# training node and one inference node (8 GPUs each, B200 or H200). Adjust
+# `num_train_gpus`/`num_infer_gpus` (single-node) or `num_train_nodes`/
+# `num_infer_nodes` (multi-node) to match your reservation; see
+# `rl/LAUNCH.md` § "Sizing".
+#
+# Reference: examples/qwen30b_math/rl.toml in PrimeIntellect-ai/prime-rl.
+# ============================================================================
+
+max_steps = 6000           # Arctic-R1 trained ~6K steps; bump to 10K if learning curve is still climbing.
+seq_len = 16384            # BIRD prompts (schema DDL + samples) cap around ~6K tokens; 16K leaves room for completions.
+
+[log]
+level = "info"
+
+[model]
+name = "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+
+[ckpt]
+interval = 500              # Save every 500 steps so we can eval the learning curve via scripts/eval_rl_checkpoint.py.
+
+[wandb]
+project = "bird-rl"
+name    = "qwen3-coder-30b-a3b-grpo"
+
+# ---- Trainer (FSDP2 + custom MoE/EP kernels) -------------------------------
+
+[trainer.model]
+impl = "custom"             # Use prime-rl's optimized qwen3_moe stack with expert parallelism.
+attn  = "flash_attention_3" # Hopper/Blackwell only. Drop to "flash_attention_2" on Ampere.
+ep    = 8                   # Expert parallelism across the 8 GPUs of one training node.
+
+[trainer.model.compile]     # Empty section — turns on torch.compile with prime-rl defaults.
+
+[trainer.model.ac]
+freq = 1                    # Activation checkpointing on every layer — needed to fit 30B at seq_len 16K.
+
+[trainer.optim]
+type = "adamw"
+lr   = 5e-7                 # See header note. Arctic-R1 used 1e-6 on 32B dense; we err conservative for MoE.
+
+# ---- Orchestrator: GRPO algorithm + rollout sampling -----------------------
+
+[orchestrator]
+batch_size            = 256  # Effective batch = batch_size * rollouts_per_example = 2048 rollouts/step.
+                             # If you're tight on inference throughput, drop to 128 first.
+rollouts_per_example  = 8    # Arctic-R1's group size.
+oversampling_factor   = 2    # Sample 2x prompts then trim to batch_size after rejection.
+max_off_policy_steps  = 8    # How stale rollouts can be before being discarded.
+
+[orchestrator.train.sampling]
+max_completion_tokens = 1024 # Plenty for a SQL query — BIRD gold SQL is rarely > 200 tokens.
+temperature           = 1.0  # Standard GRPO; we want exploration. Greedy at eval, see [orchestrator.eval].
+
+[[orchestrator.train.env]]
+id   = "bird-exec"           # Logical name registered with verifiers — see rl/LAUNCH.md § "Register environment".
+name = "bird-exec"
+
+# Args forwarded to `bird.rl_env.load_environment(...)`. Paths must exist
+# on the training node (or be reachable via the shared filesystem).
+[orchestrator.train.env.args]
+train_root        = "/shared/bird/train"   # Path containing train.json + train_databases/
+split             = "train"
+eval_root         = "/shared/bird/dev"     # Optional; used by the eval interval below.
+eval_split        = "dev"
+num_train_examples = -1                    # All ~9.4K train examples.
+num_eval_examples  = 200                   # Subsample of dev for cheap intra-run eval.
+n_samples_schema   = 3
+exec_timeout_s     = 15.0
+
+# Periodic eval on a dev subset; the full 1534-q eval lives in scripts/eval_rl_checkpoint.py
+# (run offline after each checkpoint).
+[orchestrator.eval]
+interval = 250
+
+[[orchestrator.eval.env]]
+id   = "bird-exec"
+
+[orchestrator.eval.env.args]
+train_root        = "/shared/bird/dev"
+split             = "dev"
+num_train_examples = 200
+n_samples_schema   = 3
+exec_timeout_s     = 15.0
+
+[orchestrator.eval.sampling]
+max_completion_tokens = 1024
+temperature           = 0.0   # Greedy at eval — matches our offline EX measurement protocol.
+
+[orchestrator.buffer]
+easy_threshold = 1.0          # Drop prompts where all 8 rollouts succeed (no gradient).
+hard_threshold = 0.0          # Drop prompts where all 8 rollouts fail (no gradient).
+seed           = 42
+
+# ---- Inference (vLLM, tensor-parallel) -------------------------------------
+
+[inference.parallel]
+tp = 8                        # Tensor-parallel the 30B MoE across all 8 GPUs on the inference node.
