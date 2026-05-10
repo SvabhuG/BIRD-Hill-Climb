@@ -97,6 +97,16 @@ _pending — once we know which strategies move the needle, layer the winners_
 ### Comparison to top public 32B-class results (Arctic-Text2SQL-R1-32B ≈ 73–74%)
 _to be filled_
 
+## Audit: are the regressions real, or pipeline bugs?
+
+Ran a cell-by-cell audit on all 12 finalized strategy×model results. **All cells structurally clean** (1534 predictions each, status counts re-sum, no empty SQL on non-empty status, no truncation on non-thinking cells). One bug was caught and fixed mid-matrix (linking's `_column_def` wasn't backtick-quoting BIRD's spaces-in-names columns; cost ~1.4pp on Qwen3-Coder-MoE alone). After the fix, the *residual* regressions on `linking`, `CoT`, and `fewshot` are genuine model failures, not pipeline issues:
+
+- **CoT regression dive (Qwen2.5-Coder-32B-Instruct, sample of 124 broke_it cases):** plans are 387–985 chars of well-structured natural language; raw_completion fences are clean; predicted SQL faithfully implements the plan. Failures are **commitment bias** — the plan stage locks the model into a specific column/value choice (e.g., `NCESDist` instead of `NCESSchool`; `'Directly Funded'` instead of the lower-case `'Directly funded'` that's actually in the data; `County` instead of `City`), and the SQL stage no longer second-guesses. Coder models that already do this disambiguation implicitly during free-form SQL writing get worse when forced to commit upfront in NL.
+- **Linking regression dive (Qwen3-Coder-MoE, 77 broke_it cases post backtick fix):** splits into two camps. Recall<1.0 cases (linker dropped a needed column) directly cap the answer. Recall=1.0 cases — the linker kept everything but the filtered DDL caused the model to *prefer* a different column (e.g., the precomputed `Percent (%) Eligible Free (K-12)` over the raw-count ratio that BIRD's gold actually uses). The full schema gives the model *both* options; the filtered version still has both but the visual emphasis shifts subtly. Net effect: marginal.
+- **Fewshot regression dive (Qwen3-Coder-MoE, 90 broke_it cases):** classic **anchor bias** — when train shots happen to use percentage outputs (`* 100`), aggregations (`AVG(...)`), or a particular JOIN style, the model copies those patterns into the current question even when inappropriate. Strong base models already know the right pattern; the shots add noise.
+
+**Verdict: no further bugs found. The deltas in the matrix are real signal.**
+
 ## What I'd do differently with more time
 
 1. **RL on top of the strongest base + scaffolding.** Arctic-Text2SQL-R1's recipe (reasoning-first SFT → execution-grounded RL with verl/SkyRL) is the documented path past 70%.
