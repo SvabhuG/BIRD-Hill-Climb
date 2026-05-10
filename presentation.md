@@ -112,9 +112,42 @@ Ran a cell-by-cell audit on all 12 finalized strategy×model results. **All cell
 
 **Verdict: no further bugs found. The deltas in the matrix are real signal.**
 
+## Predictions for the Qwen3.6 strategy matrix (recorded *before* runs land)
+
+The Qwen3.6-27B baseline is **63.30%**. Strategy predictions, anchored on the Qwen3-32B-thinking row (closest analog: dense, thinking, general) and adjusted for Qwen3.6's higher base quality:
+
+| strategy | predicted Δ | reasoning |
+|---|---|---|
+| linking | −1.0 to −2.0pp | Modify-prompt strategies regress on confident bases. Qwen3.6 is even more confident than Qwen3-32B-thinking (-1.23 there) → expect similar or slightly worse. |
+| voting (n=8) | 0 to +0.5pp | Thinking already explores variants internally; n=8 sampling has overlapping mechanism. Bounded by 18 exec_errors. |
+| correction | +0.3 to +0.6pp | Universal small lift. 18 exec_errors → max ~+1.2pp ceiling; realistic 30-50% rescue rate. |
+| CoT | −1.5 to −2.5pp | Explicit plan stage doubly redundant on a thinking model + commitment-bias trap. Worst regression of the row. |
+| fewshot (k=4) | +1.0 to +2.5pp | Biggest lift on Qwen3-32B-thinking (+3.07pp); Qwen3.6 has stronger SQL priors so less room for shots to teach. **Predicted strongest single strategy.** |
+
+**Combined-best prediction:** fewshot + correction (orthogonal mechanisms) ≈ +2.0pp → ~65.3% EX.
+
+Will compare to actual results when they land — falsifiable.
+
+## How the leaders at our scale tier actually win
+
+| approach | size | BIRD dev EX | core lever |
+|---|---|---:|---|
+| Arctic-Text2SQL-R1-32B (Snowflake) | 32B | **70.5%** | Pure RL on execution-correctness rewards. GRPO (not PPO). Online RL (not batch). Initialize from a strong coder-instruct base — same Qwen2.5-Coder family we used. Tiny reward function: `exec_correct + syntax_valid`, nothing else. |
+| OmniSQL-32B (Renmin University) | 32B | ~72% | LoRA fine-tune on **SynSQL-2.5M** — 2.5M synthetic text-to-SQL examples. Built on top of Qwen2.5-Coder-32B-Instruct (the same 57.37% baseline we measured). The data, not the architecture, is the lever. |
+| XiYanSQL-QwenCoder-32B (Alibaba) | 32B | 69% | Test-time scaling + ensemble: candidate generation + reranking. Closer to scaffolding family. |
+| CHESS | varies | ~81% (corrected BIRD) | Multi-agent: Information Retriever + Candidate Generator + **Unit Tester** verifier. The unit-tester is what we'd add to push correction further. |
+
+**Implications for our position (current best ~62.6% projected):**
+- Arctic-Text2SQL-R1's gain over their initialization (their initialization was a Qwen2.5-Coder-32B-Instruct ~ish at 57% → 70.5% = +13pp from RL alone). That's the size of gain we'd plausibly target.
+- OmniSQL's gain comes from data. SynSQL-2.5M is the leverage. Without 2.5M synthetic examples, we're playing a different game.
+- CHESS's "Unit Tester" is the missing piece in our scaffolding stack — a verifier agent that checks each candidate's result against constraints from the question (e.g., "are there really 0 rows or did you over-filter?") — exactly what our `is_degenerate_result` filter approximates but at the answer-shape level rather than per-question.
+- Test-time ensemble + reranking (XiYanSQL): close to our voting+correction strategy, but with a learned reranker rather than majority vote. Could be a future swap.
+
+Sources: [Arctic-Text2SQL-R1 paper](https://arxiv.org/abs/2505.20315) · [Snowflake blog](https://www.snowflake.com/en/engineering-blog/arctic-text2sql-r1-sql-generation-benchmark/) · [OmniSQL paper](https://arxiv.org/html/2503.02240v1) · [OmniSQL repo](https://github.com/RUCKBReasoning/OmniSQL) · [BIRD homepage](https://bird-bench.github.io/)
+
 ## What I'd do differently with more time
 
-1. **RL on top of the strongest base + scaffolding.** Arctic-Text2SQL-R1's recipe (reasoning-first SFT → execution-grounded RL with verl/SkyRL) is the documented path past 70%.
+1. **RL on top of the strongest base + scaffolding.** Arctic-Text2SQL-R1's recipe (reasoning-first SFT → execution-grounded RL with verl/SkyRL) is the documented path past 70%. **GRPO + online RL + execution-only reward** is the specific recipe to copy. We've already got Qwen2.5-Coder-32B-Instruct as the natural starting checkpoint (57.37% → +13pp would target 70%).
 2. **Use BIRD's `tables.json` column descriptions in prompts.** They're hand-written domain hints (e.g., "`Free Meal Count` represents…") — currently unused.
 3. **Streaming partial eval** for early-stopping clearly broken runs. Would have caught the truncated Qwen3-32B (37.55%) within the first 100 prompts instead of after the full 1,534.
 4. **Prompt explicit guidance on BIRD's idioms** — raw-count ratios over precomputed `Percent` columns; `CAST(... AS REAL)` for integer division. Recurring trap in our 7B failures.
