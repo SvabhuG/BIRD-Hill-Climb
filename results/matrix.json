@@ -1,0 +1,95 @@
+{
+  "_meta": {
+    "split": "dev",
+    "n": 1534,
+    "metric": "execution_accuracy",
+    "as_of": "2026-05-10",
+    "notes": "Living results artifact. Updated as cells complete. The presentation.md narrative wraps story/insights around these numbers."
+  },
+
+  "baselines": {
+    "Qwen/Qwen2.5-Coder-7B-Instruct":          {"ex": 0.4785, "n_correct": 734,  "exec_error": 150, "by_difficulty": {"simple": 0.5600, "moderate": 0.3707, "challenging": 0.3034}},
+    "Qwen/Qwen2.5-Coder-32B":                  {"ex": 0.4726, "n_correct": 725,  "note": "base, raw-completion (no chat template)"},
+    "Qwen/Qwen2.5-32B-Instruct":               {"ex": 0.5137, "n_correct": 788,  "note": "general (non-coder)"},
+    "Qwen/Qwen2.5-Coder-32B-Instruct":         {"ex": 0.5737, "n_correct": 880,  "exec_error": 38},
+    "Qwen/Qwen3-Coder-30B-A3B-Instruct":       {"ex": 0.6063, "n_correct": 930,  "exec_error": 25, "by_difficulty": {"simple": 0.6616, "moderate": 0.5431, "challenging": 0.4552}, "note": "current leader; MoE 30B/3B-active, no thinking"},
+    "Qwen/Qwen3-32B (max_tokens=1024 BROKEN)": {"ex": 0.3755, "n_correct": 576,  "exec_error": 623, "note": "TRUNCATED — thinking mode + 1024 cap. NOT a fair number."},
+    "Qwen/Qwen3-32B (max_tokens=8192 fair)":   {"ex": 0.5169, "n_correct": 793,  "exec_error": 23, "by_difficulty": {"simple": 0.5773, "moderate": 0.4418, "challenging": 0.3724}, "note": "dense, thinking-mode default"},
+    "Qwen/Qwen3.6-27B":                        {"ex": null,   "note": "in flight; subagent run, vllm 0.20.2 + transformers 5.8.0 + FLASH_ATTN backend"}
+  },
+
+  "strategies": {
+    "linking": {
+      "branch": "main (run_with_linking)",
+      "description": "LLM linker pass selects relevant tables/columns from a compact schema; downstream SQL gen uses filtered DDL. Lexical pass + ensure_keys closure on FKs.",
+      "bug_fixes": [
+        "FK with NULL to_column from PRAGMA — handle gracefully (commit 6c92e33)",
+        "restrict_schema → _column_def emitted column names without backticks; multi-word BIRD names became invalid DDL → exec_errors. Backtick-quote always (commit fe54b5e). Cost ~1.4pp on Qwen3-Coder-MoE, ~1.4pp on Qwen2.5-Coder."
+      ],
+      "results": {
+        "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5782, "delta": 0.0045,  "exec_error": 30, "linker_recall": 0.9783, "tag": "linking-q25c32bi-v3"},
+        "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.5926, "delta": -0.0137, "exec_error": 28, "linker_recall": 0.9750, "tag": "linking-q3cm-v2"},
+        "Qwen3-32B (thinking)":        {"ex": 0.5046, "delta": -0.0123, "exec_error": 33, "linker_recall": 0.9481, "tag": "linking-q332-v2"}
+      }
+    },
+
+    "voting": {
+      "branch": "feat/voting (commit 201a0cc)",
+      "description": "n=8 candidates per question at T=0.6. Execute each, group by canonical result-set hash (SHA-1 of sorted-repr rows), return the SQL whose result has the most votes among executable candidates.",
+      "results": {
+        "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5815, "delta": 0.0078, "exec_error": 7},
+        "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.6108, "delta": 0.0045, "exec_error": 13},
+        "Qwen3-32B (thinking)":        {"ex": null,   "delta": null,   "note": "in flight — n=8 thinking is the slowest cell, ~80min"}
+      }
+    },
+
+    "correction": {
+      "branch": "feat/correction (commit 53eeb44)",
+      "description": "First pass greedy. For exec_error cases, retry with the SQLite error message in the prompt at T=0.2. Cap at 1 retry.",
+      "results": {
+        "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5815, "delta": 0.0078, "rescued": 12, "of_exec_error": 38, "exec_error": 7},
+        "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.6154, "delta": 0.0091, "rescued": 14, "of_exec_error": 26, "exec_error": 8},
+        "Qwen3-32B (thinking)":        {"ex": 0.5209, "delta": 0.0040, "rescued": 6,  "of_exec_error": 23, "exec_error": 3}
+      }
+    },
+
+    "cot": {
+      "branch": "feat/cot (commit f6e3009)",
+      "description": "Two-stage. Stage 1: NL plan at T=0.3 (max_tokens=384). Stage 2: SQL conditioned on the plan at T=0.0 (max_tokens=1024 default; 8192 for thinking).",
+      "regression_root_cause": "commitment bias — NL plan locks model into wrong column / value choices that free-form SQL would have re-thought. e.g., NCESDist instead of NCESSchool; 'Directly Funded' instead of 'Directly funded'; County instead of City.",
+      "results": {
+        "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5495, "delta": -0.0242, "exec_error": 49},
+        "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.5874, "delta": -0.0189, "exec_error": 25},
+        "Qwen3-32B (thinking)":        {"ex": 0.5007, "delta": -0.0162, "exec_error": 50}
+      }
+    },
+
+    "fewshot": {
+      "branch": "feat/fewshot (commit 4367b33)",
+      "description": "k=4 examples retrieved from BIRD train via Jaccard on tokenized question text. Same-db_id preferred; cross-db fallback. BIRD train and dev have disjoint db_ids by design — shots are stylistic / pattern-only, never schema-cheating.",
+      "regression_root_cause_on_strong_coder": "anchor bias — shots' patterns (e.g., * 100 ratios, AVG aggregations, JOIN style) get copied into the current question even when inappropriate.",
+      "results": {
+        "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5789, "delta": 0.0052, "exec_error": 33},
+        "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.5952, "delta": -0.0111,"exec_error": 29},
+        "Qwen3-32B (thinking)":        {"ex": 0.5476, "delta": 0.0307, "exec_error": 19, "note": "biggest single-strategy lift in the matrix; non-coder thinking model has SQL-pattern gap that shots fill"}
+      }
+    }
+  },
+
+  "best_per_base": {
+    "Qwen2.5-Coder-32B-Instruct":  {"strategy": "voting OR correction (tied)", "ex": 0.5815, "delta": 0.0078},
+    "Qwen3-Coder-30B-A3B-Instruct":{"strategy": "correction",                  "ex": 0.6154, "delta": 0.0091, "is_overall_best": true},
+    "Qwen3-32B (thinking)":        {"strategy": "fewshot",                     "ex": 0.5476, "delta": 0.0307}
+  },
+
+  "key_insights": [
+    "Generation gap dominates at 32B-class: Qwen3 → Qwen2.5 closes ~3.3pp on the same coder-instruct base.",
+    "For SQL, coder post-training > thinking-mode + general post-training. Qwen3-Coder-MoE (no thinking) beats Qwen3-32B-thinking-general by ~9pp.",
+    "Stronger / newer models concentrate failures away from exec_error: 150 → 38 → 25 → 23.",
+    "CoT regresses on every coder base (-1.6 to -2.4pp) due to commitment bias.",
+    "Repair strategies (correction, voting) are universally positive but small (+0.4 to +0.9pp). Bounded by exec_error count.",
+    "Modify-the-prompt strategies (linking, fewshot) are base-dependent: help weaker / non-coder bases, hurt strong coder bases.",
+    "Schema linking with 97.8% recall STILL regressed on Qwen3-Coder-MoE (-1.37pp) because the filtered DDL tilts the model toward worse column choices even when all gold columns are kept.",
+    "On strong coder bases, the way to climb further is training (RL on execution rewards) or a better base, not more prompt scaffolding."
+  ]
+}
