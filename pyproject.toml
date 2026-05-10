@@ -10,8 +10,23 @@ dependencies = [
     "sqlglot>=25",
 ]
 
+[project.optional-dependencies]
+# Installed only when running SFT locally (e.g. for tooling/notebooks).
+# The Modal training image pins its own copies — these are for editor type
+# checking and offline experimentation, not for the GPU container.
+sft = [
+    "torch>=2.5",
+    "transformers>=5.8",
+    "unsloth",
+    "trl",
+    "datasets",
+    "peft",
+    "accelerate",
+    "bitsandbytes",
+]
+
 [tool.setuptools.packages.find]
-include = ["bird*"]
+include = ["bird*", "sft*"]
 
 [tool.ruff]
 line-length = 100
