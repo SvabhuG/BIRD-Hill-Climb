@@ -51,8 +51,17 @@ gpu_image = (
 # the standard image's transformers==4.57.0 doesn't recognize. The known-working
 # pin per main repo's matrix note is vllm 0.20.2 + transformers 5.8.0 +
 # FLASH_ATTN backend. Use this image specifically for Q3.6 runs.
+#
+# `qwen3_5`'s Gated DeltaNet requires nvcc at runtime for CUDAGraph capture, so
+# we base on the CUDA-devel image (which ships /usr/local/cuda + nvcc) instead
+# of debian_slim.
 gpu_image_q36 = (
-    modal.Image.debian_slim(python_version=_PY)
+    modal.Image.from_registry(
+        # CUDA 12.8 for B200/Blackwell (compute_100a). 12.4 fails with
+        # "Unsupported gpu architecture 'compute_100a'" when flashinfer
+        # JIT-compiles fmha kernels at warmup.
+        "nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python=_PY,
+    )
     .apt_install("git")
     .pip_install(
         "vllm==0.20.2",
@@ -61,11 +70,12 @@ gpu_image_q36 = (
         "pydantic>=2",
         "sqlglot>=25",
         "huggingface_hub",
+        # Q3.6-27B ships with FP8 kernels that require deep_gemm at runtime.
+        "deep_gemm",
     )
     .env({
         "HF_HOME": HF_HOME,
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
-        "VLLM_ATTENTION_BACKEND": "FLASH_ATTN",
     })
     .pip_install("hf_transfer")
     .add_local_python_source("bird")

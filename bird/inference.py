@@ -39,6 +39,7 @@ class VLLMEngine:
         enable_prefix_caching: bool = True,
         download_dir: str | None = None,
         trust_remote_code: bool = True,
+        enforce_eager: bool = False,
     ):
         from vllm import LLM  # noqa: WPS433  (lazy import on purpose)
 
@@ -52,6 +53,7 @@ class VLLMEngine:
             enable_prefix_caching=enable_prefix_caching,
             download_dir=download_dir,
             trust_remote_code=trust_remote_code,
+            enforce_eager=enforce_eager,
         )
 
     def chat(self, conversations: Sequence[list[dict]], cfg: GenConfig) -> list[GenOutput]:

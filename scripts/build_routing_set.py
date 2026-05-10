@@ -163,6 +163,8 @@ def main():
                     help="route if winner_count / n_candidates < this (default 0.75 = <6/8)")
     ap.add_argument("--dev-json-path", type=str, default="",
                     help="local BIRD dev.json (for hint text); default: fetch via Modal bird-data")
+    ap.add_argument("--disable-rule-3", action="store_true",
+                    help="skip vote-share rule (rule 3); use when no voting file is available")
     ap.add_argument("--disable-rule-4", action="store_true",
                     help="skip T=0.7 disagreement (rule 4); v1 has no rule 4")
     ap.add_argument("--disable-rule-5", action="store_true",
@@ -186,12 +188,20 @@ def main():
 
     # ----- Baseline + voting -----
     baseline_path = _ensure_cached("bird-results", baseline_name, args.refresh)
-    voting_path = _ensure_cached("bird-results", voting_name, args.refresh)
     baseline = json.loads(baseline_path.read_text())
-    voting = json.loads(voting_path.read_text())
+    if args.disable_rule_3:
+        print("[routing] rule 3 (low vote-share) disabled by flag")
+        voting = {"results": [], "n": 0, "ex": None}
+    else:
+        voting_path = _ensure_cached("bird-results", voting_name, args.refresh)
+        voting = json.loads(voting_path.read_text())
 
     print(f"[routing] baseline EX = {baseline['ex']:.4f}  (n={baseline['n']})")
-    print(f"[routing] voting EX   = {voting['ex']:.4f}  (n={voting['n']})")
+    voting_ex = voting.get('ex')
+    if voting_ex is not None:
+        print(f"[routing] voting EX   = {voting_ex:.4f}  (n={voting['n']})")
+    else:
+        print(f"[routing] voting EX   = (not scored; n={voting.get('n', '?')})")
     print(f"[routing] vote-share threshold = {args.vote_share_threshold} "
           f"(route if winner_count/n_candidates < this)")
 
@@ -354,7 +364,7 @@ def main():
         "rules_enabled": {
             "rule_1_exec_error": True,
             "rule_2_degenerate": True,
-            "rule_3_low_vote_share": True,
+            "rule_3_low_vote_share": not args.disable_rule_3,
             "rule_4_t07_disagree": not args.disable_rule_4,
             "rule_5_hint_col_missing": not args.disable_rule_5,
         },
