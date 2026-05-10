@@ -243,8 +243,14 @@ def evaluate_predictions(
     timeout_s: float = 30.0,
     workers: int = 8,
     save_as: str | None = None,
+    return_full: bool = False,
 ) -> dict:
-    """Run execution-accuracy on a list of predictions, return summary + per-row results."""
+    """Run execution-accuracy on a list of predictions, return summary + per-row results.
+
+    `return_full=True` returns the full per-question payload inline (used by the
+    self-correction orchestrator to filter exec_error cases without a volume
+    round-trip). Default is the slim summary, preserving existing callers.
+    """
     from bird.eval import (
         evaluate_predictions as _eval_pred,
         format_summary,
@@ -306,11 +312,14 @@ def evaluate_predictions(
         print(f"[eval] wrote {out}")
 
     # Return a slim summary; full results are on the volume if save_as was set.
-    return {
+    slim = {
         "split": split, "n": summary.n, "n_correct": summary.n_correct,
         "ex": summary.ex, "by_status": summary.by_status,
         "by_difficulty": summary.by_difficulty, "saved": save_as,
     }
+    if return_full:
+        slim["results"] = payload["results"]
+    return slim
 
 
 # ============================================================
@@ -544,4 +553,218 @@ def run_with_linking(
     summary["linking_recall_avg"] = avg_recall
     summary["linking_recall_perfect"] = perfect
     print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+# ============================================================
+# Self-correction orchestrator
+# ============================================================
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 10,
+)
+def _prepare_for_correction(
+    split: str,
+    items: list[dict],   # [{question_id, db_id, question, evidence, difficulty, failed_sql, error}]
+    n_samples: int,
+):
+    """Build correction-prompt messages for a list of exec_error questions.
+
+    Why a Modal function: schemas live on the bird-data volume. Loading them on
+    the local CLI side would either need a mount (we don't) or duplicate work.
+    Cache schemas by db_id within the call — exec_error sets are usually small
+    and concentrated on a handful of databases.
+    """
+    from bird.correction import build_correction_messages
+    from bird.data import BirdExample, load_split
+    from bird.schema import extract_schema
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    schema_cache: dict[str, object] = {}
+    msgs: list[list[dict]] = []
+    for it in items:
+        db_id = it["db_id"]
+        if db_id not in schema_cache:
+            schema_cache[db_id] = extract_schema(sp.db_path(db_id), db_id, n_samples=n_samples)
+        ex = BirdExample(
+            question_id=it["question_id"],
+            db_id=db_id,
+            question=it["question"],
+            evidence=it.get("evidence", "") or "",
+            sql="",
+            difficulty=it.get("difficulty"),
+        )
+        msgs.append(
+            build_correction_messages(
+                ex, schema_cache[db_id],
+                failed_sql=it.get("failed_sql", "") or "",
+                error_msg=it.get("error", "") or "",
+                n_samples=n_samples,
+            )
+        )
+    return msgs
+
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 10,
+)
+def _load_question_meta(split: str, limit: int) -> list[dict]:
+    """Return the question/evidence text for each example in the split.
+
+    `_prepare_local` doesn't include question/evidence in its meta payload (the
+    baseline doesn't need them after prompts are built). The correction loop
+    needs them by question_id to build retry prompts.
+    """
+    from bird.data import load_split
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    examples = sp.examples[:limit] if limit else sp.examples
+    return [
+        {
+            "question_id": ex.question_id,
+            "question": ex.question,
+            "evidence": ex.evidence,
+        }
+        for ex in examples
+    ]
+
+
+@app.local_entrypoint()
+def run_with_correction(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    n_samples: int = 3,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    retry_temperature: float = 0.2,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """Greedy first pass + self-correction retry on every exec_error case.
+
+    Two inference passes: the first pass mirrors run_baseline. We then evaluate
+    in-place (return_full=True so we don't need a volume round-trip), filter to
+    questions whose status is `exec_error`, build correction prompts (schema +
+    question + failed SQL + error), and run a second inference pass at a
+    slightly elevated temperature. The retried predictions overwrite the
+    failed ones; everything else stays as-is. We re-evaluate the merged set
+    and save that as the final result.
+
+    Note: we deliberately don't retry `wrong` cases — there's no signal that
+    the SQL is wrong (it ran, it returned rows). The model would pick the same
+    answer again. Only `exec_error` carries explicit feedback the model can use.
+    """
+    print(f"[orchestrator] preparing prompts for split={split}, limit={limit or 'all'}")
+    convos, examples_meta = _prepare_local.remote(split, limit, n_samples)
+
+    print(f"[orchestrator] {len(convos)} prompts; first-pass inference on {model} "
+          f"(tp={tensor_parallel_size})")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    raw = inf.chat.remote(convos, n=1, temperature=temperature, max_tokens=max_tokens)
+
+    predictions: list[dict] = []
+    for meta, gens in zip(examples_meta, raw):
+        text = gens[0] if gens else ""
+        sql = extract_sql(text)
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": sql,
+            "raw_completion": text,
+        })
+
+    # First-pass eval: full per-row results inline so we can filter to exec_error
+    # without a volume read. save_as=None — we only want the final, merged result on disk.
+    print("[orchestrator] first-pass eval (in-memory)")
+    first = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=None, return_full=True,
+    )
+    first_status_counts = first.get("by_status", {})
+    print(f"[first-pass] EX={first.get('ex'):.4f} by_status={first_status_counts}")
+
+    # Pull question text by id (correction prompts need it; the original meta dropped it).
+    qmeta = _load_question_meta.remote(split=split, limit=limit)
+    qmeta_by_id = {m["question_id"]: m for m in qmeta}
+
+    full_results: list[dict] = first["results"]
+    exec_error_idxs = [i for i, r in enumerate(full_results) if r.get("status") == "exec_error"]
+    n_exec_err_before = len(exec_error_idxs)
+    print(f"[correction] {n_exec_err_before} exec_error cases to retry")
+
+    if not exec_error_idxs:
+        print("[correction] nothing to retry; saving first-pass result as final")
+        save_tag = save_as or f"correction-{Path(model).name}-{split}-{int(time.time())}.json"
+        evaluate_predictions.remote(
+            split=split, predictions=predictions, save_as=save_tag,
+        )
+        print(f"[done] saved as {save_tag} on bird-results volume")
+        return
+
+    # Build correction prompts for the failed indices.
+    correction_items = []
+    for i in exec_error_idxs:
+        r = full_results[i]
+        qm = qmeta_by_id.get(r["question_id"], {})
+        correction_items.append({
+            "question_id": r["question_id"],
+            "db_id": r["db_id"],
+            "difficulty": r.get("difficulty"),
+            "question": qm.get("question", ""),
+            "evidence": qm.get("evidence", ""),
+            "failed_sql": r.get("predicted_sql", ""),
+            "error": r.get("error", ""),
+        })
+
+    print(f"[orchestrator] building {len(correction_items)} correction prompts")
+    correction_msgs = _prepare_for_correction.remote(split, correction_items, n_samples)
+
+    print(f"[orchestrator] retry inference (temperature={retry_temperature})")
+    retry_raw = inf.chat.remote(
+        correction_msgs, n=1, temperature=retry_temperature, max_tokens=max_tokens,
+    )
+
+    # Replace failed predictions with retried SQL; track corrected_from for audit.
+    for idx, gens in zip(exec_error_idxs, retry_raw):
+        text = gens[0] if gens else ""
+        new_sql = extract_sql(text)
+        prev = predictions[idx]
+        original_failed = prev.get("predicted_sql", "")
+        original_error = full_results[idx].get("error", "")
+        # If the model produced no SQL or the same SQL, leave the original in place
+        # but still record what we tried — re-eval will reproduce the original status.
+        prev["corrected_from"] = {"sql": original_failed, "error": original_error}
+        prev["correction_raw_completion"] = text
+        if new_sql and new_sql.strip() and new_sql.strip() != original_failed.strip():
+            prev["predicted_sql"] = new_sql
+
+    save_tag = save_as or f"correction-{Path(model).name}-{split}-{int(time.time())}.json"
+    print("[orchestrator] re-running execution evaluator on merged predictions")
+    final = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag, return_full=True,
+    )
+
+    # Tally how the retried questions ended up.
+    retry_outcome: dict[str, int] = {}
+    final_results = final.get("results", [])
+    final_by_id = {r["question_id"]: r for r in final_results}
+    for it in correction_items:
+        r = final_by_id.get(it["question_id"], {})
+        retry_outcome[r.get("status", "missing")] = retry_outcome.get(r.get("status", "missing"), 0) + 1
+
+    print(f"[correction] before: {n_exec_err_before} exec_errors")
+    print(f"[correction] retry outcomes: {retry_outcome}")
+    final.pop("results", None)  # don't dump the whole payload to stdout
+    print(json.dumps(final, indent=2))
     print(f"[done] saved as {save_tag} on bird-results volume")
