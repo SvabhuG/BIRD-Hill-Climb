@@ -77,7 +77,7 @@ Each strategy implemented in an isolated worktree by an autonomous subagent, com
 
 | | Qwen2.5-Coder-32B-Inst (57.37%) | Qwen3-Coder-30B-A3B-Inst (60.63%) | Qwen3-32B fair (51.69%) |
 |---|---:|---:|---:|
-| linking (post backtick-fix) | **57.82%** (+0.45) | **59.26%** (-1.37) ⬇ | v2 _running_ |
+| linking (post backtick-fix) | **57.82%** (+0.45) | **59.26%** (-1.37) ⬇ | **50.46%** (-1.23) ⬇ |
 | voting (n=8) | **58.15%** (+0.78) | **61.08%** (+0.45) | _running_ |
 | correction | **58.15%** (+0.78) | **61.54%** (+0.91) | **52.09%** (+0.40) |
 | CoT | **54.95%** (-2.42) ⬇ | **58.74%** (-1.89) ⬇ | **50.07%** (-1.62) ⬇ |
