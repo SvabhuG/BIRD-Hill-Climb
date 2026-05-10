@@ -148,6 +148,30 @@ The Qwen3.6-27B baseline is **63.30%**. Strategy predictions, anchored on the Qw
 
 Will compare to actual results when they land — falsifiable.
 
+## What's still failing on our current best (correction × Qwen3-Coder-MoE = 61.54%)
+
+579 of 1,534 questions are still wrong (37.7%). Distribution:
+- **By difficulty**: 304 simple / 202 moderate / 73 challenging — the *simple* bucket has the most absolute losses; surprising, but reflects that the dataset is mostly simple (925/1534), and the model misses ~33% of those (`100% − 67%`).
+- **Worst DBs** (sorted by % wrong): `card_games` 49.7% wrong, `formula_1` 50%, `california_schools` 47.2% wrong, `thrombosis_prediction` 55.8% wrong. These four DBs account for ~50% of all errors.
+
+Heuristic categorization of the 579 wrong predictions (one row can match multiple categories):
+- **JOIN-count mismatch (54.6%)**: pred has 0 joins, gold has 2 — pred uses a single-table query when gold pulls from joined tables. The model under-anticipates that questions about (e.g.) "schools in Riverside with charter funding" need the `frpm` join.
+- **ORDER BY mismatch (12.6%)**: pred missing or wrong ORDER BY, often paired with a `LIMIT`.
+- **GROUP BY mismatch (8.1%)**: aggregation grouping wrong (or absent).
+- **CAST mismatch (6.6%)**: classic integer-division trap — gold uses `CAST(... AS REAL) / ...`, pred uses bare `/`.
+- **Aggregation mismatch**: SUM/MAX/COUNT/MIN/AVG wrongly chosen ~20% combined.
+- **LIKE vs `=`**: 4.3% — typically when filter is "starts with X" but pred uses exact equality.
+
+Sampled cases tell a sharper story:
+- **`Percent (%) Eligible Free`** vs **`Free Meal Count / Enrollment`** (q1) — model uses the precomputed % column; BIRD's gold prefers the raw-count ratio. Recurring trap visible across many DBs that have both forms of a metric.
+- **Same-named columns on wrong tables** (q28 — `Charter Funding Type` exists on `frpm`; pred uses it on `schools` (no such column)). The audit's earlier *commitment-bias* finding for CoT shows up here too — the model commits to a column without verifying which table holds it.
+- **Question-interpretation ambiguity** (q36 — "administrator" → one name vs all six FName/LName slots). BIRD's gold tends to be inclusive when the schema has `Adm1/2/3` slots; the model picks one.
+
+**What would address these:**
+- The JOIN-undercount pattern is exactly what schema linking *should* fix when done right — but our linking strategy regressed (-1.37) because the filtered DDL itself confused the model. **A "join-required" pre-prompt hint** (deterministic: count occurrences of FK references that the question's columns might need) is a cheap unexplored lever.
+- The `Percent` vs `ratio` trap is **prompt-engineering**: a system-prompt addendum like "*BIRD prefers raw counts (e.g. `Free Meal Count (K-12) / Enrollment (K-12)`) over precomputed percentage columns; use `CAST(... AS REAL)` for integer division*" would likely close 3-5pp of these losses. Free, untested.
+- The "wrong-table-for-this-column" failure pattern is what **CHESS's "Information Retriever"** agent addresses: a per-(question, schema) retrieval that returns column→table assignments before SQL generation. Missing piece in our scaffolding.
+
 ## How the leaders at our scale tier actually win
 
 | approach | size | BIRD dev EX | core lever |
