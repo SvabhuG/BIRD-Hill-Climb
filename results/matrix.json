@@ -41,7 +41,7 @@
         "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5815, "delta": 0.0078, "exec_error": 7},
         "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.6108, "delta": 0.0045, "exec_error": 13},
         "Qwen3-Coder-30B-A3B-Instruct (T=1.0)":{"ex": 0.6076, "delta": 0.0013, "exec_error": 13, "note": "DIAGNOSTIC: bumped to T=1.0 to test MoE-expert-diversity hypothesis. RESULT: WORSE than T=0.6 (+0.13 vs +0.45). Voting on this base is bounded by model capability, not sampling diversity. R1 hypothesis falsified."},
-        "Qwen3-32B (thinking, v2)":    {"ex": null,   "delta": null,   "note": "in flight — v2 re-run after the v1 hit 1h Modal timeout; 2h cap now"}
+        "Qwen3-32B (thinking)":        {"ex": null,   "delta": null,   "note": "INFEASIBLE: timed out twice — v1 at 60min Modal cap, v2 at 120min cap (78% complete). n=8 thinking-mode voting × 1534 questions exceeds Modal's per-function 2h limit. Stacked design (which only votes on failing tail) is the practical alternative."}
       }
     },
 
