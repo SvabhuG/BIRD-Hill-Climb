@@ -228,6 +228,7 @@ class Inference:
     model_name: str = modal.parameter(default="Qwen/Qwen2.5-Coder-7B-Instruct")
     tensor_parallel_size: int = modal.parameter(default=1)
     max_model_len: int = modal.parameter(default=16384)
+    tokenizer_name: str = modal.parameter(default="")  # override tokenizer (e.g. for SFT'd ckpts whose saved tokenizer files have a transformers-version mismatch)
 
     @modal.enter()
     def _load(self):
@@ -240,6 +241,7 @@ class Inference:
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             download_dir=HF_HOME,
+            tokenizer=self.tokenizer_name or None,
         )
         print(f"[inference] loaded {self.model_name} in {time.time() - t0:.1f}s")
 
@@ -466,6 +468,40 @@ def _prepare_local(split: str, limit: int, n_samples: int):
     volumes={BIRD_ROOT: bird_data},
     timeout=60 * 10,
 )
+def _prepare_sft_flat(split: str, limit: int, n_samples: int):
+    """Build flat (preamble + markdown body) prompts for SFT-Base eval.
+
+    Matches `bird.sft_format.build_sft_prompt` byte-for-byte — same function
+    is used at training time, so the SFT'd model sees identical inputs.
+    """
+    from bird.data import load_split
+    from bird.schema import extract_schema
+    from bird.sft_format import build_sft_prompt
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    examples = sp.examples[:limit] if limit else sp.examples
+
+    schema_cache: dict[str, object] = {}
+    prompts: list[str] = []
+    metas: list[dict] = []
+    for ex in examples:
+        if ex.db_id not in schema_cache:
+            schema_cache[ex.db_id] = extract_schema(sp.db_path(ex.db_id), ex.db_id, n_samples=n_samples)
+        prompts.append(build_sft_prompt(ex, schema_cache[ex.db_id], n_samples=n_samples))
+        metas.append({
+            "question_id": ex.question_id,
+            "db_id": ex.db_id,
+            "difficulty": ex.difficulty,
+            "gold_sql": ex.sql,
+        })
+    return prompts, metas
+
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 10,
+)
 def _prepare_for_linking(split: str, limit: int, n_samples: int):
     """Build linker prompts + return per-DB schemas + per-question metadata.
 
@@ -500,6 +536,65 @@ def _prepare_for_linking(split: str, limit: int, n_samples: int):
             "gold_sql": ex.sql,
         })
     return linker_msgs, schemas, metas
+
+
+@app.local_entrypoint()
+def run_sft_eval(
+    split: str = "dev",
+    limit: int = 0,
+    checkpoint: str = "/checkpoints/sft_32b_base/final",
+    base_model_for_tokenizer: str = "Qwen/Qwen2.5-Coder-32B",
+    n_samples: int = 3,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """Greedy zero-shot eval against an SFT'd checkpoint on the sft_checkpoints volume.
+
+    Format alignment: uses `bird.sft_format.build_sft_prompt` — the same flat
+    prompt the SFT training built — so the model sees byte-identical inputs
+    to what it was trained on. Inference stops are the section-header
+    pattern (`INFERENCE_STOPS`) to prevent hallucinated `### Question`
+    continuations from the Base.
+    """
+    print(f"[orchestrator] preparing prompts for split={split}, limit={limit or 'all'}")
+    raw_prompts, examples_meta = _prepare_sft_flat.remote(split, limit, n_samples)
+
+    print(f"[orchestrator] {len(raw_prompts)} prompts; loading SFT checkpoint {checkpoint}")
+    inf = Inference(
+        model_name=checkpoint,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        tokenizer_name=base_model_for_tokenizer,
+    )
+    save_tag = save_as or f"sft-{Path(checkpoint).parent.name}-{split}-{int(time.time())}.json"
+
+    from bird.sft_format import INFERENCE_STOPS
+    raw = inf.complete.remote(
+        raw_prompts, n=1, temperature=temperature, max_tokens=max_tokens, stop=INFERENCE_STOPS,
+    )
+
+    predictions = []
+    for meta, gens in zip(examples_meta, raw):
+        text = gens[0] if gens else ""
+        sql = extract_sql(text)
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": sql,
+            "raw_completion": text,
+        })
+
+    print("[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag,
+    )
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
 
 
 @app.local_entrypoint()

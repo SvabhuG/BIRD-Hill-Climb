@@ -39,11 +39,17 @@ class VLLMEngine:
         enable_prefix_caching: bool = True,
         download_dir: str | None = None,
         trust_remote_code: bool = True,
+        tokenizer: str | None = None,
     ):
         from vllm import LLM  # noqa: WPS433  (lazy import on purpose)
 
         self.model = model
-        self._llm = LLM(
+        # `tokenizer` overrides vLLM's default of loading the tokenizer from
+        # `model`'s path. Needed for SFT'd checkpoints whose saved tokenizer
+        # files use a different transformers-version format than our eval
+        # image — pass the original HF id (e.g. "Qwen/Qwen2.5-Coder-32B") to
+        # load a known-good tokenizer while still serving the SFT'd weights.
+        llm_kwargs = dict(
             model=model,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
@@ -53,6 +59,9 @@ class VLLMEngine:
             download_dir=download_dir,
             trust_remote_code=trust_remote_code,
         )
+        if tokenizer:
+            llm_kwargs["tokenizer"] = tokenizer
+        self._llm = LLM(**llm_kwargs)
 
     def chat(self, conversations: Sequence[list[dict]], cfg: GenConfig) -> list[GenOutput]:
         """Run a batch of chat-message lists through vLLM.
