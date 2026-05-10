@@ -453,6 +453,8 @@ def run_with_linking(
     model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
     n_samples: int = 3,
     use_lexical: bool = True,
+    max_tokens: int = 1024,
+    linker_max_tokens: int = 512,
     save_as: str = "",
 ):
     """Schema-linker pass + filtered SQL gen + eval. Reports linking-recall alongside EX.
@@ -483,7 +485,7 @@ def run_with_linking(
 
     print(f"[orchestrator] {len(linker_msgs)} questions; linker pass on {model}")
     inf = Inference(model_name=model)
-    linker_outs = inf.chat.remote(linker_msgs, n=1, temperature=0.0, max_tokens=512)
+    linker_outs = inf.chat.remote(linker_msgs, n=1, temperature=0.0, max_tokens=linker_max_tokens)
 
     print("[orchestrator] parsing linker outputs + lexical augmentation + ensure_keys")
     selections: list[Selection] = []
@@ -521,7 +523,7 @@ def run_with_linking(
         gen_msgs.append(build_messages(ex, narrow, n_samples=n_samples))
 
     print(f"[orchestrator] {len(gen_msgs)} gen prompts; SQL generation pass")
-    gen_outs = inf.chat.remote(gen_msgs, n=1, temperature=0.0, max_tokens=1024)
+    gen_outs = inf.chat.remote(gen_msgs, n=1, temperature=0.0, max_tokens=max_tokens)
 
     predictions = []
     for meta, raw, sel, recall in zip(metas, gen_outs, selections, recalls):
