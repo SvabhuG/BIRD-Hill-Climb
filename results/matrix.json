@@ -62,7 +62,8 @@
       "results": {
         "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5495, "delta": -0.0242, "exec_error": 49},
         "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.5874, "delta": -0.0189, "exec_error": 25},
-        "Qwen3-32B (thinking)":        {"ex": 0.5007, "delta": -0.0162, "exec_error": 50}
+        "Qwen3-32B (thinking)":        {"ex": 0.5007, "delta": -0.0162, "exec_error": 50},
+        "Qwen3.6-27B":                 {"ex": 0.6226, "delta": -0.0104, "exec_error": 18, "note": "Regressed less than predicted (-1.5 to -2.5pp); thinking + plan stage doubly redundant on a thinking model."}
       }
     },
 

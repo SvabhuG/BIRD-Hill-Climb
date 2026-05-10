@@ -163,15 +163,17 @@ The Qwen3.6-27B baseline is **63.30%**. Strategy predictions, anchored on the Qw
 
 **Combined-best prediction:** fewshot + correction (orthogonal mechanisms) ≈ +2.0pp → ~65.3% EX.
 
-### Actual vs predicted (as of partial results)
+### Actual vs predicted (4/5 cells; voting killed for cost)
 
 | strategy | predicted | actual | hit/miss |
 |---|---|---:|---|
 | linking | −1.0 to −2.0pp | **−4.17pp** | miss (worse than expected — biggest regression in matrix) |
 | correction | +0.3 to +0.6pp | **+0.00pp** | miss (correction floor reached: too few exec_errors to rescue) |
 | fewshot | +1.0 to +2.5pp | **−0.39pp** | **big miss** — predicted strongest single lift; was actually slightly negative |
-| CoT | −1.5 to −2.5pp | _running_ | — |
-| voting | 0 to +0.5pp | _running_ | — |
+| CoT | −1.5 to −2.5pp | **−1.04pp** | hit (regressed less severely than expected) |
+| voting | 0 to +0.5pp | killed (3h ETA) | — |
+
+**No strategy improved Qwen3.6.** Best is correction tied with baseline at 63.30%. This is the cleanest possible signal that scaffolding is a function of base-model weakness — when the base is strong (Qwen3.6 has the fewest exec_errors of any base, the highest simple-bucket EX, the highest moderate-bucket EX), every form of intervention either does nothing or degrades.
 
 **What the misses tell us:** Qwen3.6 is *more confident* than the closest analog (Qwen3-32B-thinking). The "modify-the-prompt" strategies (linking, fewshot) hurt more on confident bases — the gap between "model already knows the right SQL" and "scaffolding adds noise" widens with model strength. The correction floor was telegraphed by the small exec_error count (~18) but I underestimated how cleanly it'd hit zero. **The prediction framework "Qwen3.6 ≈ Qwen3-32B-thinking" was the wrong mental model — Qwen3.6 is a different beast: more parametric SQL knowledge, less responsive to in-context teaching.**
 
