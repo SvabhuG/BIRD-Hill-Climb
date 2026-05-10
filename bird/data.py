@@ -25,9 +25,12 @@ class BirdExample:
     difficulty: str | None  # simple/moderate/challenging on dev; None on test
 
     @classmethod
-    def from_json(cls, obj: dict) -> "BirdExample":
+    def from_json(cls, obj: dict, fallback_id: int = -1) -> "BirdExample":
+        # BIRD train.json doesn't include `question_id`; only dev does. Fall
+        # back to a caller-supplied sequential index so train examples get
+        # stable unique IDs for retrieval/tie-break.
         return cls(
-            question_id=int(obj["question_id"]),
+            question_id=int(obj.get("question_id", fallback_id)),
             db_id=obj["db_id"],
             question=obj["question"],
             evidence=obj.get("evidence", "") or "",
@@ -64,7 +67,7 @@ def load_split(root: str | Path, name: str = "dev") -> BirdSplit:
     with questions_path.open() as f:
         raw = json.load(f)
 
-    examples = [BirdExample.from_json(o) for o in raw]
+    examples = [BirdExample.from_json(o, fallback_id=i) for i, o in enumerate(raw)]
     db_dir = root / f"{name}_databases"
     if not db_dir.exists():
         raise FileNotFoundError(f"{db_dir} not found — expected `{name}_databases/` next to {name}.json")
