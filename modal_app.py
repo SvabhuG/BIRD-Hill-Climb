@@ -446,6 +446,129 @@ def _prepare_for_linking(split: str, limit: int, n_samples: int):
     return linker_msgs, schemas, metas
 
 
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 10,
+)
+def _prepare_for_cot(split: str, limit: int, n_samples: int):
+    """Build stage-1 (plan) prompts + per-DB schemas + per-question metadata.
+
+    Mirrors `_prepare_for_linking`: schemas are returned as a unique-by-db_id
+    dict so we can rebuild stage-2 (SQL-from-plan) prompts locally without
+    re-extracting schemas. Stage-2 prompts depend on the model's stage-1
+    output, so we can't pre-build them here.
+    """
+    from bird.cot import build_plan_messages
+    from bird.data import load_split
+    from bird.schema import extract_schema
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    examples = sp.examples[:limit] if limit else sp.examples
+
+    schemas: dict[str, object] = {}
+    plan_msgs: list[list[dict]] = []
+    metas: list[dict] = []
+    for ex in examples:
+        if ex.db_id not in schemas:
+            schemas[ex.db_id] = extract_schema(sp.db_path(ex.db_id), ex.db_id, n_samples=n_samples)
+        plan_msgs.append(build_plan_messages(ex, schemas[ex.db_id], n_samples=n_samples))
+        metas.append({
+            "question_id": ex.question_id,
+            "db_id": ex.db_id,
+            "question": ex.question,
+            "evidence": ex.evidence,
+            "difficulty": ex.difficulty,
+            "gold_sql": ex.sql,
+        })
+    return plan_msgs, schemas, metas
+
+
+@app.local_entrypoint()
+def run_with_cot(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    n_samples: int = 3,
+    plan_max_tokens: int = 384,
+    sql_max_tokens: int = 1024,
+    plan_temperature: float = 0.3,
+    sql_temperature: float = 0.0,
+    save_as: str = "",
+):
+    """Two-stage plan-then-SQL chain-of-thought.
+
+    Stage 1: ask the model for a 3-6 sentence natural-language plan describing
+             which tables/columns/filters/aggregations to use.
+    Stage 2: feed the plan back in alongside the same schema/question/evidence
+             and ask for the SQL.
+
+    Two forward passes per question. Plan is captured on each prediction as a
+    passthrough field so failures can be inspected: bad plan vs. good plan that
+    the SQL stage failed to follow are very different bugs.
+    """
+    # CoT-only deps: imported here so `run_baseline` and `run_with_linking`
+    # don't need them in the local CLI's Python.
+    from bird.cot import build_sql_with_plan_messages, extract_plan
+    from bird.data import BirdExample
+
+    print(f"[orchestrator] preparing CoT plan prompts for split={split}, limit={limit or 'all'}")
+    plan_msgs, schemas, metas = _prepare_for_cot.remote(split, limit, n_samples)
+
+    print(f"[orchestrator] {len(plan_msgs)} questions; stage-1 plan pass on {model} "
+          f"(temp={plan_temperature}, max_tokens={plan_max_tokens})")
+    inf = Inference(model_name=model)
+    plan_outs = inf.chat.remote(
+        plan_msgs, n=1, temperature=plan_temperature, max_tokens=plan_max_tokens,
+    )
+
+    print("[orchestrator] extracting plans + building stage-2 SQL prompts")
+    plans: list[str] = []
+    sql_msgs: list[list[dict]] = []
+    for raw, meta in zip(plan_outs, metas):
+        plan_text = extract_plan(raw[0] if raw else "")
+        plans.append(plan_text)
+        ex = BirdExample(
+            question_id=meta["question_id"], db_id=meta["db_id"],
+            question=meta["question"], evidence=meta["evidence"],
+            sql="", difficulty=meta["difficulty"],
+        )
+        sql_msgs.append(
+            build_sql_with_plan_messages(ex, schemas[meta["db_id"]], plan_text, n_samples=n_samples)
+        )
+
+    n_empty_plans = sum(1 for p in plans if not p)
+    print(f"[cot] stage-1 produced {len(plans) - n_empty_plans} plans "
+          f"({n_empty_plans} empty / fell back to plain SQL gen)")
+
+    print(f"[orchestrator] stage-2 SQL pass on {model} "
+          f"(temp={sql_temperature}, max_tokens={sql_max_tokens})")
+    sql_outs = inf.chat.remote(
+        sql_msgs, n=1, temperature=sql_temperature, max_tokens=sql_max_tokens,
+    )
+
+    predictions = []
+    for meta, gens, plan_text in zip(metas, sql_outs, plans):
+        text = gens[0] if gens else ""
+        sql = extract_sql(text)
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": sql,
+            "raw_completion": text,
+            "plan": plan_text,
+        })
+
+    save_tag = save_as or f"cot-{Path(model).name}-{split}-{int(time.time())}.json"
+    print("[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(split=split, predictions=predictions, save_as=save_tag)
+    summary["n_empty_plans"] = n_empty_plans
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
 @app.local_entrypoint()
 def run_with_linking(
     split: str = "dev",
