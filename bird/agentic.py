@@ -78,7 +78,8 @@ from .schema import DatabaseSchema, render_ddl_with_samples
 
 # ----------------------- prompts -----------------------
 
-AGENT_SYSTEM = """\
+# v2 prompts: 3 tools (execute_sql, submit, keep_baseline_sql), baseline-SQL anchored.
+AGENT_SYSTEM_V2 = """\
 You are a senior data analyst writing correct, idiomatic SQLite SQL.
 
 You are given a BASELINE candidate SQL drafted by a strong zero-shot model.
@@ -122,7 +123,7 @@ Rules:
   ending without trailing prose."""
 
 
-AGENT_USER = """\
+AGENT_USER_V2 = """\
 ### Database schema (SQLite)
 ```sql
 {schema_block}
@@ -141,6 +142,54 @@ AGENT_USER = """\
 
 Begin. Probe with execute_sql if helpful. Then either submit a fix or call
 keep_baseline_sql if you can't point to a specific defect."""
+
+
+# v1 prompts: 2 tools (execute_sql, submit) only. No baseline anchor.
+AGENT_SYSTEM_V1 = """\
+You are a senior data analyst writing correct, idiomatic SQLite SQL.
+
+You have two tools you can call by emitting a JSON block:
+
+```json
+{"tool": "execute_sql", "args": {"sql": "SELECT ..."}}
+```
+  Runs the SQL read-only against the target SQLite database and returns rows
+  (truncated to 20) or an error string. Use it to verify your draft works,
+  to peek at column values you're unsure about, or to count results.
+
+```json
+{"tool": "submit", "args": {"sql": "SELECT ..."}}
+```
+  Submits your final answer and ends the session. Call this exactly once,
+  at the end, with the SELECT statement that answers the question.
+
+Rules:
+- Emit at most ONE JSON tool block per message. After it, stop.
+- Use execute_sql freely (up to 5 times) to test drafts. Tool output is fed
+  back to you; reason briefly on what changed, then either refine and try
+  again, or call submit.
+- Only the SQL inside submit's `args.sql` is graded. Make it a single
+  SELECT (or WITH ... SELECT) ending without trailing prose."""
+
+
+AGENT_USER_V1 = """\
+### Database schema (SQLite)
+```sql
+{schema_block}
+```
+
+### External knowledge / hint
+{evidence}
+
+### Question
+{question}
+
+Begin. Test your draft with execute_sql if helpful, then call submit."""
+
+
+# Defaults: legacy callers (smoke tests) keep v2 semantics.
+AGENT_SYSTEM = AGENT_SYSTEM_V2
+AGENT_USER = AGENT_USER_V2
 
 
 # ----------------------- tool dispatch -----------------------
@@ -270,18 +319,36 @@ def build_initial_messages(
     schema: DatabaseSchema,
     n_samples: int = 3,
     baseline_sql: str = "",
+    agentic_version: str = "v2",
 ) -> list[dict]:
+    """Build the initial system/user messages for the agent.
+
+    `agentic_version`:
+        "v2" (default) — 3 tools (execute_sql / submit / keep_baseline_sql),
+                         baseline SQL shown in the user message.
+        "v1"           — 2 tools (execute_sql / submit) only, NO baseline anchor.
+                         Reproduces the original Q3-Coder-MoE +2.02pp recipe.
+    """
     schema_block = render_ddl_with_samples(schema, n_samples=n_samples).strip()
     evidence = (example.evidence or "").strip() or "(none provided)"
-    baseline_sql_clean = (baseline_sql or "").strip() or "-- (no baseline available)"
-    user = AGENT_USER.format(
-        schema_block=schema_block,
-        evidence=evidence,
-        question=example.question.strip(),
-        baseline_sql=baseline_sql_clean,
-    )
+    if agentic_version == "v1":
+        user = AGENT_USER_V1.format(
+            schema_block=schema_block,
+            evidence=evidence,
+            question=example.question.strip(),
+        )
+        system_text = AGENT_SYSTEM_V1
+    else:
+        baseline_sql_clean = (baseline_sql or "").strip() or "-- (no baseline available)"
+        user = AGENT_USER_V2.format(
+            schema_block=schema_block,
+            evidence=evidence,
+            question=example.question.strip(),
+            baseline_sql=baseline_sql_clean,
+        )
+        system_text = AGENT_SYSTEM_V2
     return [
-        {"role": "system", "content": AGENT_SYSTEM},
+        {"role": "system", "content": system_text},
         {"role": "user", "content": user},
     ]
 
@@ -294,6 +361,7 @@ def step_agent(
     tool_timeout_s: float = 10.0,
     chat_fn=None,
     baseline_sql: str = "",
+    agentic_version: str = "v2",
 ) -> AgentTrace:
     """Run the agent loop until termination or budget exhaustion.
 
@@ -301,7 +369,9 @@ def step_agent(
     Modal/vLLM (smoke tests can pass a mock function).
 
     `baseline_sql` is the candidate SQL the baseline produced for this question.
-    If the agent calls `keep_baseline_sql`, this string becomes the final SQL.
+    If the agent calls `keep_baseline_sql` (v2 only), this string becomes the
+    final SQL. In v1 mode keep_baseline_sql is not exposed and budget-exhaustion
+    falls back to the last executed SQL, NOT the baseline.
     """
     assert chat_fn is not None, "chat_fn is required"
     if "question_id" in messages[0]:  # defensive: don't expect this layout
@@ -333,6 +403,13 @@ def step_agent(
             break
 
         if call["tool"] == "keep_baseline_sql":
+            if agentic_version == "v1":
+                # v1 doesn't expose this tool — if the model still emits it,
+                # treat as unknown-tool error and continue.
+                n_exec_errors += 1
+                messages = messages + [{"role": "user", "content":
+                    "ERROR: unknown tool `keep_baseline_sql`. Available: execute_sql, submit."}]
+                continue
             final_sql = (baseline_sql or "").strip()
             finish_reason = "keep_baseline"
             break
@@ -352,8 +429,13 @@ def step_agent(
         messages = messages + [{"role": "user", "content": run_tool(call["tool"], call.get("args") or {}, db_path)}]
 
     if finish_reason == "budget" and not final_sql:
-        # Best-effort: prefer baseline (anchored answer) over last-tried draft.
-        final_sql = (baseline_sql or "").strip() or last_executed_sql
+        if agentic_version == "v1":
+            # v1: budget-exhaustion falls back to the last executed SQL only
+            # (no baseline anchoring in v1's contract).
+            final_sql = last_executed_sql
+        else:
+            # v2: prefer baseline (anchored answer) over last-tried draft.
+            final_sql = (baseline_sql or "").strip() or last_executed_sql
 
     # Strip trailing prose / fences / semicolons consistently with extract_sql.
     if final_sql:

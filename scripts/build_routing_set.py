@@ -147,6 +147,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--refresh", action="store_true",
                     help="re-download input files from Modal volumes")
+    ap.add_argument("--baseline", type=str, default=BASELINE_NAME,
+                    help="baseline filename on bird-results volume")
+    ap.add_argument("--voting", type=str, default=VOTING_NAME,
+                    help="voting filename on bird-results volume")
+    ap.add_argument("--degenerate-name", type=str, default=DEGEN_NAME,
+                    help="degenerate-flags filename on bird-results volume")
+    ap.add_argument("--t07-name", type=str, default=T07_DIFF_NAME,
+                    help="T=0.7 disagreement filename on bird-results volume")
     ap.add_argument("--degeneracy-from", type=str, default="",
                     help="path to a {qid: bool} JSON; default: fetch DEGEN_NAME from bird-results")
     ap.add_argument("--t07-disagreement-from", type=str, default="",
@@ -155,12 +163,30 @@ def main():
                     help="route if winner_count / n_candidates < this (default 0.75 = <6/8)")
     ap.add_argument("--dev-json-path", type=str, default="",
                     help="local BIRD dev.json (for hint text); default: fetch via Modal bird-data")
+    ap.add_argument("--disable-rule-4", action="store_true",
+                    help="skip T=0.7 disagreement (rule 4); v1 has no rule 4")
+    ap.add_argument("--disable-rule-5", action="store_true",
+                    help="skip hint-column-not-in-SQL (rule 5); v1 has no rule 5")
+    ap.add_argument("--v1", action="store_true",
+                    help="shortcut: v1 routing (rules 1+2+3, threshold 0.625 / <5/8)")
     ap.add_argument("--out", type=str, default=str(RESULTS_DIR / "routing_set.json"))
     args = ap.parse_args()
 
+    if args.v1:
+        # v1: only rules 1 (exec_error), 2 (degenerate), 3 (vote-share < 5/8).
+        args.vote_share_threshold = 0.625
+        args.disable_rule_4 = True
+        args.disable_rule_5 = True
+
+    # Override globals from arg names.
+    baseline_name = args.baseline
+    voting_name = args.voting
+    degen_name = args.degenerate_name
+    t07_name = args.t07_name
+
     # ----- Baseline + voting -----
-    baseline_path = _ensure_cached("bird-results", BASELINE_NAME, args.refresh)
-    voting_path = _ensure_cached("bird-results", VOTING_NAME, args.refresh)
+    baseline_path = _ensure_cached("bird-results", baseline_name, args.refresh)
+    voting_path = _ensure_cached("bird-results", voting_name, args.refresh)
     baseline = json.loads(baseline_path.read_text())
     voting = json.loads(voting_path.read_text())
 
@@ -193,7 +219,7 @@ def main():
     # ----- Rule 2: degenerate result -----
     deg_path_local = args.degeneracy_from
     if not deg_path_local:
-        deg_path_local = str(_ensure_cached("bird-results", DEGEN_NAME, args.refresh))
+        deg_path_local = str(_ensure_cached("bird-results", degen_name, args.refresh))
     degenerate_qids: set[int] = set()
     deg_payload = json.loads(Path(deg_path_local).read_text())
     for k, v in deg_payload.items():
@@ -211,14 +237,17 @@ def main():
     # ----- Rule 4: T=0.7 disagreement -----
     t07_qids: set[int] = set()
     t07_path_local = args.t07_disagreement_from
-    if not t07_path_local:
-        candidate = CACHE_DIR / f"bird-results__{T07_DIFF_NAME}"
+    if args.disable_rule_4:
+        print("[routing] rule 4 (T=0.7 disagreement) disabled by flag")
+        t07_path_local = ""
+    elif not t07_path_local:
+        candidate = CACHE_DIR / f"bird-results__{t07_name}"
         # If the file isn't on the volume yet (T=0.7 hasn't been generated),
         # skip rule 4 cleanly so the v2 ablation still runs partially.
         try:
-            t07_path_local = str(_ensure_cached("bird-results", T07_DIFF_NAME, args.refresh))
+            t07_path_local = str(_ensure_cached("bird-results", t07_name, args.refresh))
         except subprocess.CalledProcessError:
-            print(f"[routing] WARNING: {T07_DIFF_NAME} not on bird-results volume; "
+            print(f"[routing] WARNING: {t07_name} not on bird-results volume; "
                   "rule 4 (T=0.7 disagreement) will be EMPTY")
             t07_path_local = ""
     if t07_path_local and Path(t07_path_local).exists():
@@ -234,7 +263,10 @@ def main():
     # ----- Rule 5: hint-column-not-in-SQL -----
     hint_miss_qids: set[int] = set()
     dev_path = args.dev_json_path
-    if not dev_path:
+    if args.disable_rule_5:
+        print("[routing] rule 5 (hint-column-not-in-SQL) disabled by flag")
+        dev_path = ""
+    elif not dev_path:
         try:
             dev_path = str(_ensure_cached("bird-data", DEV_JSON_NAME, args.refresh))
         except subprocess.CalledProcessError:
@@ -313,11 +345,18 @@ def main():
         "question_ids": sorted(routed),
         "rules": {k: sorted(v) for k, v in rule_sets.items()},
         "inputs": {
-            "baseline": BASELINE_NAME,
-            "voting": VOTING_NAME,
-            "degenerate": DEGEN_NAME,
-            "t07_disagreement": T07_DIFF_NAME,
+            "baseline": baseline_name,
+            "voting": voting_name,
+            "degenerate": degen_name,
+            "t07_disagreement": t07_name,
             "dev_json": DEV_JSON_NAME,
+        },
+        "rules_enabled": {
+            "rule_1_exec_error": True,
+            "rule_2_degenerate": True,
+            "rule_3_low_vote_share": True,
+            "rule_4_t07_disagree": not args.disable_rule_4,
+            "rule_5_hint_col_missing": not args.disable_rule_5,
         },
     }
 

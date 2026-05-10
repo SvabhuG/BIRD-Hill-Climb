@@ -47,6 +47,30 @@ gpu_image = (
     .add_local_python_source("bird")
 )
 
+# Q3.6-27B has a hybrid Gated DeltaNet architecture (model type `qwen3_5`) that
+# the standard image's transformers==4.57.0 doesn't recognize. The known-working
+# pin per main repo's matrix note is vllm 0.20.2 + transformers 5.8.0 +
+# FLASH_ATTN backend. Use this image specifically for Q3.6 runs.
+gpu_image_q36 = (
+    modal.Image.debian_slim(python_version=_PY)
+    .apt_install("git")
+    .pip_install(
+        "vllm==0.20.2",
+        "transformers==5.8.0",
+        "tqdm",
+        "pydantic>=2",
+        "sqlglot>=25",
+        "huggingface_hub",
+    )
+    .env({
+        "HF_HOME": HF_HOME,
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        "VLLM_ATTENTION_BACKEND": "FLASH_ATTN",
+    })
+    .pip_install("hf_transfer")
+    .add_local_python_source("bird")
+)
+
 app = modal.App(APP_NAME)
 
 
@@ -73,6 +97,8 @@ class Agent:
     n_samples: int = modal.parameter(default=3)
     max_tokens: int = modal.parameter(default=1024)
     temperature_x100: int = modal.parameter(default=0)     # 0 == greedy
+    # "v1" -> 2-tool / no-baseline-anchor recipe; "v2" -> 3-tool w/ keep_baseline_sql.
+    agentic_version: str = modal.parameter(default="v2")
 
     @modal.enter()
     def _load(self):
@@ -149,6 +175,7 @@ class Agent:
             t0 = time.time()
             msgs = build_initial_messages(
                 ex, schema, n_samples=self.n_samples, baseline_sql=baseline_sql,
+                agentic_version=self.agentic_version,
             )
             try:
                 trace = step_agent(
@@ -158,6 +185,7 @@ class Agent:
                     tool_timeout_s=tool_timeout_s,
                     chat_fn=chat_fn,
                     baseline_sql=baseline_sql,
+                    agentic_version=self.agentic_version,
                 )
             except Exception as e:
                 print(f"[agent] q{ex.question_id}: trace crashed: {e!r}")
@@ -440,6 +468,7 @@ def run_agentic_routed(
     save_as: str = "",
     tensor_parallel_size: int = 1,
     max_model_len: int = 16384,
+    agentic_version: str = "v2",
 ):
     """Run the agent ONLY on `routing_from`'s question_ids, then merge with
     `baseline_filename`'s predictions for the unrouted questions and score
@@ -473,6 +502,7 @@ def run_agentic_routed(
         n_samples=n_samples,
         max_tokens=max_tokens,
         temperature_x100=int(round(temperature * 100)),
+        agentic_version=agentic_version,
     )
     result = agent.solve_batch.remote(
         split=split, limit=0, save_as=tag, question_ids=qids,
@@ -560,6 +590,420 @@ def _fetch_baseline_via_volume(filename: str) -> dict:
     without needing a local copy of the baseline file.
     """
     return json.loads((Path(RESULTS_ROOT) / filename).read_text())
+
+
+@app.cls(
+    image=gpu_image_q36,
+    gpu="B200",
+    volumes={HF_HOME: hf_cache, BIRD_ROOT: bird_data, RESULTS_ROOT: results_vol},
+    timeout=2 * 60 * 60,
+    scaledown_window=300,
+)
+class AgentQ36:
+    """Qwen3.6-27B-aware variant of Agent, using vllm 0.20.2 + transformers 5.8.0."""
+
+    model_name: str = modal.parameter(default="Qwen/Qwen3.6-27B")
+    tensor_parallel_size: int = modal.parameter(default=1)
+    max_model_len: int = modal.parameter(default=16384)
+    max_turns: int = modal.parameter(default=6)
+    tool_timeout_cs: int = modal.parameter(default=1000)
+    n_samples: int = modal.parameter(default=3)
+    max_tokens: int = modal.parameter(default=1024)
+    temperature_x100: int = modal.parameter(default=0)
+    agentic_version: str = modal.parameter(default="v1")
+
+    @modal.enter()
+    def _load(self):
+        from bird.inference import VLLMEngine
+
+        t0 = time.time()
+        self.engine = VLLMEngine(
+            model=self.model_name,
+            tensor_parallel_size=self.tensor_parallel_size,
+            max_model_len=self.max_model_len,
+            download_dir=HF_HOME,
+        )
+        print(f"[agent-q36] loaded {self.model_name} in {time.time() - t0:.1f}s")
+
+    @modal.method()
+    def solve_batch(
+        self,
+        split: str,
+        limit: int,
+        save_as: str,
+        question_ids: list[int] | None = None,
+        baseline_sql_by_qid: dict[str, str] | None = None,
+    ) -> dict:
+        from bird.agentic import build_initial_messages, step_agent
+        from bird.data import load_split
+        from bird.inference import GenConfig
+        from bird.schema import extract_schema
+
+        sp = load_split(Path(BIRD_ROOT) / split, name=split)
+        if question_ids is not None:
+            wanted = set(int(q) for q in question_ids)
+            examples = [ex for ex in sp.examples if ex.question_id in wanted]
+            missing = wanted - {ex.question_id for ex in examples}
+            if missing:
+                print(f"[agent-q36] WARNING: {len(missing)} requested qids not in split "
+                      f"(sample: {sorted(missing)[:5]})")
+            print(f"[agent-q36] subset mode: routing {len(examples)}/{len(wanted)} questions")
+        else:
+            examples = sp.examples[:limit] if limit else sp.examples
+
+        temperature = self.temperature_x100 / 100.0
+        tool_timeout_s = self.tool_timeout_cs / 100.0
+        cfg = GenConfig(n=1, temperature=temperature, top_p=1.0, max_tokens=self.max_tokens)
+        baseline_lookup: dict[int, str] = {}
+        if baseline_sql_by_qid:
+            for k, v in baseline_sql_by_qid.items():
+                try:
+                    baseline_lookup[int(k)] = v or ""
+                except (TypeError, ValueError):
+                    continue
+        if baseline_lookup:
+            print(f"[agent-q36] baseline SQL available for {len(baseline_lookup)} qids")
+
+        def chat_fn(messages):
+            outs = self.engine.chat([messages], cfg)
+            return outs[0].texts[0] if outs and outs[0].texts else ""
+
+        schema_cache: dict = {}
+        predictions: list[dict] = []
+        traces: list[dict] = []
+
+        for i, ex in enumerate(examples):
+            if ex.db_id not in schema_cache:
+                schema_cache[ex.db_id] = extract_schema(
+                    sp.db_path(ex.db_id), ex.db_id, n_samples=self.n_samples,
+                )
+            schema = schema_cache[ex.db_id]
+            db_path = sp.db_path(ex.db_id)
+            baseline_sql = baseline_lookup.get(ex.question_id, "")
+
+            t0 = time.time()
+            msgs = build_initial_messages(
+                ex, schema, n_samples=self.n_samples, baseline_sql=baseline_sql,
+                agentic_version=self.agentic_version,
+            )
+            try:
+                trace = step_agent(
+                    msgs,
+                    db_path=db_path,
+                    max_turns=self.max_turns,
+                    tool_timeout_s=tool_timeout_s,
+                    chat_fn=chat_fn,
+                    baseline_sql=baseline_sql,
+                    agentic_version=self.agentic_version,
+                )
+            except Exception as e:
+                print(f"[agent-q36] q{ex.question_id}: trace crashed: {e!r}")
+                trace = None
+
+            elapsed = time.time() - t0
+            if trace is None:
+                predictions.append({
+                    "question_id": ex.question_id, "db_id": ex.db_id,
+                    "difficulty": ex.difficulty, "gold_sql": ex.sql,
+                    "predicted_sql": "", "raw_completion": "",
+                })
+                traces.append({
+                    "question_id": ex.question_id, "turns": 0, "n_tool_calls": 0,
+                    "n_exec_errors": 0, "completion_chars": 0, "finish_reason": "crash",
+                    "elapsed_s": elapsed,
+                })
+                continue
+
+            predictions.append({
+                "question_id": ex.question_id, "db_id": ex.db_id,
+                "difficulty": ex.difficulty, "gold_sql": ex.sql,
+                "predicted_sql": trace.final_sql, "raw_completion": "",
+            })
+            traces.append({
+                "question_id": ex.question_id, "db_id": ex.db_id,
+                "difficulty": ex.difficulty,
+                "turns": trace.turns, "n_tool_calls": trace.n_tool_calls,
+                "n_exec_errors": trace.n_exec_errors,
+                "completion_chars": trace.completion_chars,
+                "finish_reason": trace.finish_reason, "elapsed_s": elapsed,
+                "history": trace.history,
+            })
+            if (i + 1) % 10 == 0 or i == len(examples) - 1:
+                print(f"[agent-q36] {i + 1}/{len(examples)}  q{ex.question_id} "
+                      f"turns={trace.turns} calls={trace.n_tool_calls} "
+                      f"finish={trace.finish_reason} t={elapsed:.1f}s")
+
+        if save_as:
+            out = Path(RESULTS_ROOT) / save_as.replace(".json", ".traces.json")
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(traces, indent=2, default=str))
+            results_vol.commit()
+            print(f"[agent-q36] wrote traces to {out}")
+
+        n = len(traces)
+        finish_counts: dict[str, int] = {}
+        for t in traces:
+            finish_counts[t["finish_reason"]] = finish_counts.get(t["finish_reason"], 0) + 1
+        return {
+            "predictions": predictions,
+            "stats": {
+                "n": n,
+                "avg_turns": sum(t["turns"] for t in traces) / max(n, 1),
+                "avg_tool_calls": sum(t["n_tool_calls"] for t in traces) / max(n, 1),
+                "avg_exec_errors": sum(t["n_exec_errors"] for t in traces) / max(n, 1),
+                "avg_completion_chars": sum(t["completion_chars"] for t in traces) / max(n, 1),
+                "finish_reason_counts": finish_counts,
+            },
+        }
+
+
+@app.cls(
+    image=gpu_image_q36,
+    gpu="B200",
+    volumes={HF_HOME: hf_cache, BIRD_ROOT: bird_data, RESULTS_ROOT: results_vol},
+    timeout=2 * 60 * 60,
+    scaledown_window=300,
+)
+class SamplerQ36:
+    """Qwen3.6-27B-aware Sampler, mirroring Sampler but on the q36 image."""
+
+    model_name: str = modal.parameter(default="Qwen/Qwen3.6-27B")
+    tensor_parallel_size: int = modal.parameter(default=1)
+    max_model_len: int = modal.parameter(default=16384)
+
+    @modal.enter()
+    def _load(self):
+        from bird.inference import VLLMEngine
+
+        t0 = time.time()
+        self.engine = VLLMEngine(
+            model=self.model_name,
+            tensor_parallel_size=self.tensor_parallel_size,
+            max_model_len=self.max_model_len,
+            download_dir=HF_HOME,
+        )
+        print(f"[sampler-q36] loaded {self.model_name} in {time.time() - t0:.1f}s")
+
+    @modal.method()
+    def vote_full(
+        self,
+        split: str,
+        n_votes: int,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        save_as: str,
+        vote_timeout_s: float = 15.0,
+    ) -> dict:
+        from bird.data import load_split
+        from bird.inference import GenConfig
+        from bird.prompts import build_messages, extract_sql
+        from bird.schema import extract_schema
+        from bird.voting import vote as _vote
+
+        sp = load_split(Path(BIRD_ROOT) / split, name=split)
+        examples = sp.examples
+        print(f"[voting-q36] preparing prompts for {len(examples)} questions")
+
+        schema_cache: dict = {}
+        convos: list[list[dict]] = []
+        metas: list[dict] = []
+        for ex in examples:
+            if ex.db_id not in schema_cache:
+                schema_cache[ex.db_id] = extract_schema(
+                    sp.db_path(ex.db_id), ex.db_id, n_samples=3,
+                )
+            convos.append(build_messages(ex, schema_cache[ex.db_id], n_samples=3))
+            metas.append({
+                "question_id": ex.question_id, "db_id": ex.db_id,
+                "difficulty": ex.difficulty, "gold_sql": ex.sql,
+            })
+
+        cfg = GenConfig(n=n_votes, temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+        print(f"[voting-q36] generating n={n_votes} per question at T={temperature} top_p={top_p}")
+        t0 = time.time()
+        outs = self.engine.chat(convos, cfg)
+        print(f"[voting-q36] generated samples in {time.time() - t0:.1f}s")
+
+        split_root = Path(BIRD_ROOT) / split
+        db_dir = split_root / f"{split}_databases"
+
+        predictions: list[dict] = []
+        t_vote = time.time()
+        for meta, out in zip(metas, outs):
+            cands = [extract_sql(t) for t in (out.texts or [])]
+            db_path = str(db_dir / meta["db_id"] / f'{meta["db_id"]}.sqlite')
+            outcome = _vote(cands, db_path, timeout_s=vote_timeout_s)
+            predictions.append({
+                "question_id": meta["question_id"], "db_id": meta["db_id"],
+                "difficulty": meta["difficulty"], "gold_sql": meta["gold_sql"],
+                "predicted_sql": outcome["winner_sql"],
+                "candidate_sqls": cands,
+                "voting_metadata": {
+                    "winner_count": outcome["winner_count"],
+                    "n_candidates": outcome["n_candidates"],
+                    "n_executable": outcome["n_executable"],
+                    "n_distinct_results": outcome["n_distinct_results"],
+                    "fallback_used": outcome["fallback_used"],
+                },
+            })
+        print(f"[voting-q36] vote done in {time.time() - t_vote:.1f}s")
+
+        if save_as:
+            out_path = Path(RESULTS_ROOT) / save_as
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps({
+                "split": split, "n": len(predictions), "n_votes": n_votes,
+                "temperature": temperature, "top_p": top_p,
+                "results": predictions,
+            }, indent=2))
+            results_vol.commit()
+            print(f"[voting-q36] wrote {out_path}")
+
+        return {"split": split, "n": len(predictions), "saved": save_as}
+
+
+@app.local_entrypoint()
+def run_voting_q36(
+    split: str = "dev",
+    model: str = "Qwen/Qwen3.6-27B",
+    n_votes: int = 8,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    max_tokens: int = 1024,
+    vote_timeout_s: float = 15.0,
+    save_as: str = "voting-qwen3.6-27b-dev-full.json",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """Q3.6-specific voting entrypoint (uses gpu_image_q36)."""
+    print(f"[voting-q36] {model} split={split} n_votes={n_votes} T={temperature}")
+    sampler = SamplerQ36(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    summary = sampler.vote_full.remote(
+        split=split, n_votes=n_votes, max_tokens=max_tokens,
+        temperature=temperature, top_p=top_p, save_as=save_as,
+        vote_timeout_s=vote_timeout_s,
+    )
+    print(json.dumps(summary, indent=2))
+
+
+@app.local_entrypoint()
+def run_agentic_routed_q36(
+    split: str = "dev",
+    routing_from: str = "results/routing_set.json",
+    baseline_filename: str = "baseline-qwen3.6-27b-dev-full.json",
+    model: str = "Qwen/Qwen3.6-27B",
+    max_turns: int = 6,
+    tool_timeout_s: float = 10.0,
+    n_samples: int = 3,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+    agentic_version: str = "v1",
+):
+    """Q3.6-specific routed-agentic entrypoint.
+
+    Same pipeline as `run_agentic_routed` but uses AgentQ36 on the q36 image
+    (vllm 0.20.2 + transformers 5.8.0). Default agentic_version is "v1".
+    """
+    routing_payload = json.loads(Path(routing_from).read_text())
+    qids: list[int] = list(routing_payload["question_ids"])
+    if not qids:
+        raise SystemExit("routing set is empty; nothing to do")
+    if len(qids) < 50:
+        raise SystemExit(f"routing set too small ({len(qids)} < 50); aborting per spec")
+
+    tag = save_as or f"agentic-routed-q36-{split}-{len(qids)}-{agentic_version}-{int(time.time())}.json"
+    print(f"[routed-q36] running agent ({agentic_version}) on {len(qids)} questions; tag={tag}")
+
+    print(f"[routed-q36] fetching baseline from {baseline_filename}")
+    baseline_payload = _fetch_baseline_via_volume.remote(baseline_filename)
+    baseline_sql_by_qid: dict[str, str] = {
+        str(int(r["question_id"])): (r.get("predicted_sql") or "")
+        for r in baseline_payload["results"]
+    }
+
+    agent = AgentQ36(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+        max_turns=max_turns,
+        tool_timeout_cs=int(round(tool_timeout_s * 100)),
+        n_samples=n_samples,
+        max_tokens=max_tokens,
+        temperature_x100=int(round(temperature * 100)),
+        agentic_version=agentic_version,
+    )
+    result = agent.solve_batch.remote(
+        split=split, limit=0, save_as=tag, question_ids=qids,
+        baseline_sql_by_qid=baseline_sql_by_qid,
+    )
+    agent_preds = result["predictions"]
+    agent_stats = result["stats"]
+
+    print("[routed-q36] agent stats:")
+    print(json.dumps(agent_stats, indent=2))
+
+    routed_only_tag = tag.replace(".json", ".routed_only.json")
+    if not routed_only_tag.endswith(".json"):
+        routed_only_tag += ".routed_only.json"
+    print(f"[routed-q36] scoring agent-only predictions → {routed_only_tag}")
+    routed_summary = evaluate_predictions.remote(
+        split=split, predictions=agent_preds, save_as=routed_only_tag,
+    )
+    print("[routed-q36] agent-on-routed:")
+    print(json.dumps(routed_summary, indent=2))
+
+    print(f"[routed-q36] merging with baseline predictions from {baseline_filename}")
+    routed_set = set(int(q) for q in qids)
+    agent_by_qid = {int(p["question_id"]): p for p in agent_preds}
+
+    merged_preds: list[dict] = []
+    for r in baseline_payload["results"]:
+        qid = int(r["question_id"])
+        if qid in routed_set and qid in agent_by_qid:
+            ap = agent_by_qid[qid]
+            merged_preds.append({
+                "question_id": qid, "db_id": r["db_id"],
+                "difficulty": r.get("difficulty"),
+                "gold_sql": r.get("gold_sql", ""),
+                "predicted_sql": ap.get("predicted_sql", ""),
+                "raw_completion": "", "source": "agent",
+            })
+        else:
+            merged_preds.append({
+                "question_id": qid, "db_id": r["db_id"],
+                "difficulty": r.get("difficulty"),
+                "gold_sql": r.get("gold_sql", ""),
+                "predicted_sql": r.get("predicted_sql", ""),
+                "raw_completion": "", "source": "baseline",
+            })
+
+    merged_tag = tag.replace(".json", ".merged.json")
+    print(f"[routed-q36] scoring merged full-dev predictions → {merged_tag}")
+    merged_summary = evaluate_predictions.remote(
+        split=split, predictions=merged_preds, save_as=merged_tag,
+    )
+    print("[routed-q36] merged full-dev:")
+    print(json.dumps(merged_summary, indent=2))
+
+    print()
+    print("=" * 60)
+    print("[routed-q36] FINAL SUMMARY")
+    print("=" * 60)
+    print(f"  routed-set size           : {len(qids)}")
+    print(f"  baseline EX on routed     : {routing_payload.get('baseline_routed_ex'):.4f}")
+    print(f"  agent EX on routed        : {routed_summary['ex']:.4f}")
+    print(f"  merged full-dev EX        : {merged_summary['ex']:.4f}")
+    print(f"  baseline full-dev EX      : {baseline_payload['ex']:.4f}")
+    print(f"  saved agent-only          : {routed_only_tag}")
+    print(f"  saved merged              : {merged_tag}")
 
 
 @app.cls(
@@ -661,6 +1105,133 @@ class Sampler:
             print(f"[sampler] wrote {out_path}")
 
         return {"split": split, "n": len(predictions), "saved": save_as}
+
+    @modal.method()
+    def vote_full(
+        self,
+        split: str,
+        n_votes: int,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        save_as: str,
+        vote_timeout_s: float = 15.0,
+    ) -> dict:
+        """Generate n_votes candidates per question and majority-vote on execution.
+
+        Mirrors `run_with_voting` from feat/voting on the main app, packaged
+        inside the agentic worktree so we don't have to switch images.
+        Writes a file shaped like `voting-*-dev-full.json` with per-result
+        `voting_metadata` so the routing builder's rule 3 can consume it.
+        """
+        from bird.data import load_split
+        from bird.inference import GenConfig
+        from bird.prompts import build_messages, extract_sql
+        from bird.schema import extract_schema
+        from bird.voting import vote as _vote
+
+        sp = load_split(Path(BIRD_ROOT) / split, name=split)
+        examples = sp.examples
+        print(f"[voting] preparing prompts for {len(examples)} questions")
+
+        schema_cache: dict = {}
+        convos: list[list[dict]] = []
+        metas: list[dict] = []
+        for ex in examples:
+            if ex.db_id not in schema_cache:
+                schema_cache[ex.db_id] = extract_schema(
+                    sp.db_path(ex.db_id), ex.db_id, n_samples=3,
+                )
+            convos.append(build_messages(ex, schema_cache[ex.db_id], n_samples=3))
+            metas.append({
+                "question_id": ex.question_id,
+                "db_id": ex.db_id,
+                "difficulty": ex.difficulty,
+                "gold_sql": ex.sql,
+            })
+
+        cfg = GenConfig(
+            n=n_votes, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+        )
+        print(f"[voting] generating n={n_votes} per question at T={temperature} top_p={top_p}")
+        t0 = time.time()
+        outs = self.engine.chat(convos, cfg)
+        print(f"[voting] generated samples in {time.time() - t0:.1f}s")
+
+        split_root = Path(BIRD_ROOT) / split
+        db_dir = split_root / f"{split}_databases"
+
+        predictions: list[dict] = []
+        t_vote = time.time()
+        for meta, out in zip(metas, outs):
+            cands = [extract_sql(t) for t in (out.texts or [])]
+            db_path = str(db_dir / meta["db_id"] / f'{meta["db_id"]}.sqlite')
+            outcome = _vote(cands, db_path, timeout_s=vote_timeout_s)
+            predictions.append({
+                "question_id": meta["question_id"],
+                "db_id": meta["db_id"],
+                "difficulty": meta["difficulty"],
+                "gold_sql": meta["gold_sql"],
+                "predicted_sql": outcome["winner_sql"],
+                "candidate_sqls": cands,
+                "voting_metadata": {
+                    "winner_count": outcome["winner_count"],
+                    "n_candidates": outcome["n_candidates"],
+                    "n_executable": outcome["n_executable"],
+                    "n_distinct_results": outcome["n_distinct_results"],
+                    "fallback_used": outcome["fallback_used"],
+                },
+            })
+        print(f"[voting] vote done in {time.time() - t_vote:.1f}s")
+
+        if save_as:
+            out_path = Path(RESULTS_ROOT) / save_as
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps({
+                "split": split, "n": len(predictions), "n_votes": n_votes,
+                "temperature": temperature, "top_p": top_p,
+                "results": predictions,
+            }, indent=2))
+            results_vol.commit()
+            print(f"[voting] wrote {out_path}")
+
+        return {"split": split, "n": len(predictions), "saved": save_as}
+
+
+@app.local_entrypoint()
+def run_voting(
+    split: str = "dev",
+    model: str = "Qwen/Qwen3.6-27B",
+    n_votes: int = 8,
+    temperature: float = 0.6,
+    top_p: float = 0.95,
+    max_tokens: int = 1024,
+    vote_timeout_s: float = 15.0,
+    save_as: str = "voting-qwen3.6-27b-dev-full.json",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """Generate n=8 voting candidates per question + majority-vote on execution.
+
+    Output schema matches `voting-*-dev-full.json` on the bird-results volume so
+    `scripts/build_routing_set.py` can ingest it for rule 3 (low vote-share).
+    """
+    print(f"[voting] {model} split={split} n_votes={n_votes} T={temperature}")
+    sampler = Sampler(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    summary = sampler.vote_full.remote(
+        split=split,
+        n_votes=n_votes,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        save_as=save_as,
+        vote_timeout_s=vote_timeout_s,
+    )
+    print(json.dumps(summary, indent=2))
 
 
 @app.local_entrypoint()
