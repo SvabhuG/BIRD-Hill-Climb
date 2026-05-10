@@ -79,7 +79,7 @@ Each strategy implemented in an isolated worktree by an autonomous subagent, com
 |---|---:|---:|---:|
 | linking | **56.45%** (-0.92) ⬇ recall=97.8% | **57.43%** (-3.20) ⬇⬇ recall=97.5% | _running_ |
 | voting (n=8) | **58.15%** (+0.78) | **61.08%** (+0.45) | _running_ |
-| correction | **58.15%** (+0.78) | **61.54%** (+0.91) | _running_ |
+| correction | **58.15%** (+0.78) | **61.54%** (+0.91) | **52.09%** (+0.40) |
 | CoT | **54.95%** (-2.42) ⬇ | **58.74%** (-1.89) ⬇ | _running_ |
 | fewshot | (train layout fix-up running) | (waiting) | (waiting) |
 
