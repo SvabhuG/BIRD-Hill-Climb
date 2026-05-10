@@ -268,11 +268,20 @@ def ensure_keys(selection: Selection, schema: DatabaseSchema) -> Selection:
             if c.pk:
                 extra.add((tname, c.name.lower()))
         for fk in t.foreign_keys:
-            extra.add((tname, fk.from_column.lower()))
-            # Also include the target side so the join is fully usable
-            target = fk.to_table.lower()
-            if target in by_name:
-                extra.add((target, fk.to_column.lower()))
+            if fk.from_column:
+                extra.add((tname, fk.from_column.lower()))
+            # Also include the target side so the join is fully usable. SQLite's
+            # PRAGMA foreign_key_list returns NULL for the target column when the
+            # FK references the target's implicit PK; in that case fall back to the
+            # target table's primary-key column.
+            target = fk.to_table.lower() if fk.to_table else None
+            if target and target in by_name:
+                target_col = (fk.to_column or "").lower()
+                if not target_col:
+                    target_pk = by_name[target].primary_key
+                    target_col = target_pk[0].lower() if target_pk else ""
+                if target_col:
+                    extra.add((target, target_col))
     return Selection(columns=selection.columns | frozenset(extra))
 
 
@@ -309,8 +318,9 @@ def restrict_schema(schema: DatabaseSchema, selection: Selection) -> DatabaseSch
         kept_pk = [n for n in t.primary_key if n.lower() in kept_names]
         kept_fks = [
             fk for fk in t.foreign_keys
-            if fk.from_column.lower() in kept_names
-            and fk.to_table.lower() in keep_by_table
+            if fk.from_column and fk.from_column.lower() in kept_names
+            and fk.to_table and fk.to_table.lower() in keep_by_table
+            and fk.to_column
             and fk.to_column.lower() in keep_by_table[fk.to_table.lower()]
         ]
 
