@@ -203,6 +203,49 @@ Sampled cases tell a sharper story:
 - The `Percent` vs `ratio` trap is **prompt-engineering**: a system-prompt addendum like "*BIRD prefers raw counts (e.g. `Free Meal Count (K-12) / Enrollment (K-12)`) over precomputed percentage columns; use `CAST(... AS REAL)` for integer division*" would likely close 3-5pp of these losses. Free, untested.
 - The "wrong-table-for-this-column" failure pattern is what **CHESS's "Information Retriever"** agent addresses: a per-(question, schema) retrieval that returns column→table assignments before SQL generation. Missing piece in our scaffolding.
 
+## The structural ceiling: what no strategy can solve
+
+Built a per-question matrix over **22 of our runs** (5 baselines + 17 strategy cells). For each of the 1534 dev questions, counted how many runs got it right. Bucket distribution:
+
+| bucket | count | % of dev |
+|---|---:|---:|
+| universally solved (22/22) | 398 | 25.9% |
+| mostly solved (≥12/22) | 505 | 32.9% |
+| sometimes solved (3-11/22) | 257 | 16.8% |
+| rarely solved (1-2/22) | 75 | 4.9% |
+| **universally unsolved (0/22)** | **299** | **19.5%** |
+
+**The 299 universally-unsolved questions are the structural ceiling on scaffolding-only approaches.** Maximum theoretical EX with perfect scaffolding = 1535 − 299 = **80.5%**. To exceed that, you need either RL training (Arctic-R1's path) or a fundamentally more capable base.
+
+**Where the unsolvable bucket clusters:**
+- By difficulty: moderate 24.4%, challenging 24.8%, simple 16.2% (most absolute losses are on simples because of the dataset weighting)
+- By DB: **`card_games` is the worst** (68/191 = 35.6% unsolvable). `formula_1`, `toxicology`, `thrombosis_prediction` close behind at 21–24%. `student_club` is the best (8.2%).
+
+**Gold-SQL feature enrichment in the unsolvable bucket** (vs base rate over all 1534):
+
+| feature | enrichment | implication |
+|---|---:|---|
+| ≥10 JOINs | 2.57× | extreme multi-table reasoning |
+| `LIKE` pattern | 1.95× | string-pattern matching / normalization |
+| CTE | 1.71× | multi-stage decomposition |
+| subquery | 1.71× | nested SELECT |
+| multi-SELECT compose | 1.67× | compositional structure in the gold |
+| multi-col SELECT (4+) | 1.60× | wide projection (e.g., "give all admin name slots") |
+| NULL handling | 1.57× | `IS NULL` / `IS NOT NULL` filters |
+| `CASE WHEN` | 1.31× | conditional projection logic |
+
+**Four root-cause buckets** (read 5 samples manually):
+
+1. **Idiomatic SQL the model doesn't write.** q514's gold uses `LIMIT 0, 10` (MySQL-style `offset, count`). The model writes `LIMIT 10`, returns the wrong slice. Pure syntax-knowledge gap.
+2. **Entity-string normalization.** q995 needs filters on exact strings `'Lewis'`, `'Hamilton'`, `'Turkish Grand Prix'` joined across drivers / driverStandings / races. The model often falls back to `LIKE '%Hamilton%'` or drops the race-name filter — schema linking theoretically helps here but our matrix shows it doesn't in practice.
+3. **Multi-stage compositional arithmetic.** q125 (challenging, financial): `CAST((T3.A13 - T3.A12) AS REAL) * 100 / T3.A12` — year-over-year percentage. Requires CAST + subtract + multiply + divide chained. Even thinking-mode models drop steps.
+4. **BIRD-specific gold idioms.** Recurring across simples and moderates: "raw-count ratio over precomputed `Percent (%)` column" — gold prefers `Free Meal Count / Enrollment` over the existing `Percent (%) Eligible Free` column. The model has no signal that gold prefers this idiom.
+
+**What this implies for "what to do next":**
+- The 80.5% scaffolding ceiling is well below Arctic-R1's 70.5% — meaning RL on the same base would hit our scaffolding ceiling and keep climbing. RL is the right next step, not more scaffolding.
+- The 299 unsolvable cluster is dominated by *capability* gaps (multi-stage arithmetic, idiom learning, syntax-pattern coverage) — these are the failure modes RL with execution-only reward directly trains *against*.
+- The `card_games` wedge (35.6% unsolvable!) suggests targeted training on that DB's question patterns could move EX +2-3pp on its own.
+
 ## How the leaders at our scale tier actually win
 
 | approach | size | BIRD dev EX | core lever |
