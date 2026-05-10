@@ -102,6 +102,26 @@ _pending — once we know which strategies move the needle, layer the winners_
 ### Comparison to top public 32B-class results (Arctic-Text2SQL-R1-32B ≈ 73–74%)
 _to be filled_
 
+## Composition: voting + within-vote correction (Qwen3-Coder-MoE)
+
+Combined the two repair strategies into a single 3-pass flow (sample n=8 at T=0.7 → execute all → batched retry on exec_error candidates at T=0.0 → vote on the upgraded pool with `prefer_nondegenerate` set to drop empty/all-NULL results when non-degenerate is the majority).
+
+Result: **61.15% (+0.52pp)** — *between* voting alone (+0.45) and correction alone (+0.91), not beyond either. **The composition did not compound.**
+
+| variant | EX | Δ vs baseline | exec_error |
+|---|---:|---:|---:|
+| baseline | 60.63% | — | 25 |
+| voting alone (n=8) | 61.08% | +0.45 | 13 |
+| **correction alone** | **61.54%** | **+0.91** | 8 |
+| voting + correction | 61.15% | +0.52 | **1** |
+
+Why the failure to compound:
+1. **Voting and correction target the same failure mode (exec_error rescue) via different mechanisms.** Voting fixes "1 of 8 samples gets it right" via diversity; correction fixes "explicit retry with the error in context." Different mechanisms, mostly overlapping coverage.
+2. **The vote step can pick a *wrong* non-error answer that correction alone would never produce.** Correction alone is anchored on greedy SQL (T=0); voting's pool at T=0.7 has more variance, and the result-hash majority sometimes converges on a confidently-wrong query.
+3. **Exec_error went 25 → 1**: the within-vote retry mechanically *works* — almost all errors got fixed. But fixing them just shifts the population from "fail" to "wrong", which doesn't help EX.
+
+**Lesson: composing strategies with overlapping mechanisms doesn't add up.** For meaningful gains, compose strategies that address *orthogonal* failure modes — e.g., correction (exec_error) + a verifier-style filter (semantic-wrong detection) + a column-disambiguation pass.
+
 ## Audit: are the regressions real, or pipeline bugs?
 
 Ran a cell-by-cell audit on all 12 finalized strategy×model results. **All cells structurally clean** (1534 predictions each, status counts re-sum, no empty SQL on non-empty status, no truncation on non-thinking cells). One bug was caught and fixed mid-matrix (linking's `_column_def` wasn't backtick-quoting BIRD's spaces-in-names columns; cost ~1.4pp on Qwen3-Coder-MoE alone). After the fix, the *residual* regressions on `linking`, `CoT`, and `fewshot` are genuine model failures, not pipeline issues:
