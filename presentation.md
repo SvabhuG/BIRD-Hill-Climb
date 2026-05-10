@@ -32,14 +32,14 @@
 | Qwen2.5-Coder-32B-Instruct | 2.5 | dense, coder | 57.37% | 38 |
 | **Qwen3-Coder-30B-A3B-Instruct** | 3 | **MoE, coder** | **60.63%** | 25 |
 | Qwen3-32B (dense, thinking-on, max_tokens=1024) | 3 | dense, general | 37.55% ⚠ | 623 ⚠ — *truncation artifact* |
-| Qwen3-32B (dense, thinking-on, max_tokens=8192) | 3 | dense, general | _running_ | — |
+| Qwen3-32B (dense, thinking-on, max_tokens=8192 — *fair*) | 3 | dense, general | 51.69% | 23 |
 | Qwen3.6-27B | 3.6 | dense, general | _agent debugging vllm pin_ | — |
 
 **Insights from the sweep:**
 - **Generation gap dominates** at 32B-class: Qwen3 → Qwen2.5 closes ~3.3pp on the same coder-instruct base.
-- **Coder-tuning matters** at the Qwen2.5 generation: Coder-32B-Instruct beats general-32B-Instruct by 6pp.
-- **Better models concentrate failures away from exec_error**: 150 → 38 → 25 going from 7B-Instruct → 32B-Coder-Instruct → 30B-Coder-MoE. Larger/newer models write more syntactically-valid SQL out of the box.
-- **Thinking on Qwen3 needs ≥8192 max_tokens**: the 1024 default cuts off SQL after the reasoning trace. Documented as a configuration trap.
+- **Coder-tuning matters more than thinking on SQL**: at the Qwen3 generation, Coder-MoE-no-thinking (60.63%) beats dense-general-with-thinking (51.69%) by **9pp**. For SQL specifically, dedicated coder post-training is worth more than chain-of-thought reasoning.
+- **Better models concentrate failures away from exec_error**: 150 → 38 → 25 → 23 going from 7B-Instruct → 32B-Coder-Instruct → 30B-Coder-MoE → Qwen3-32B-thinking. Stronger / newer / thinking-mode models all write more syntactically-valid SQL out of the box, which **shrinks the ceiling for self-correction strategies**.
+- **Thinking on Qwen3 needs ≥8192 max_tokens**: the 1024 default cuts off SQL after the reasoning trace, dropping EX from 51.69% (fair) to 37.55% (broken). Documented as a configuration trap.
 
 ### Phase 3 — inference-time strategies (4 parallel git worktrees, 4 subagents)
 
@@ -75,18 +75,18 @@ Each strategy implemented in an isolated worktree by an autonomous subagent, com
 
 ### Strategy × Model matrix (5×3 = 15 cells)
 
-| | Qwen2.5-Coder-32B-Inst (57.37%) | Qwen3-Coder-30B-A3B-Inst (60.63%) | Qwen3-32B fair (pending) |
+| | Qwen2.5-Coder-32B-Inst (57.37%) | Qwen3-Coder-30B-A3B-Inst (60.63%) | Qwen3-32B fair (51.69%) |
 |---|---:|---:|---:|
 | linking | _running_ | _running_ | _running_ |
 | voting (n=8) | _running_ | _running_ | _running_ |
 | correction | **58.15%** (+0.78) | _running_ | _running_ |
-| CoT | _running_ | _running_ | _running_ |
+| CoT | **54.95%** (-2.42) | **58.74%** (-1.89) | _running_ |
 | fewshot | (pending train dl) | (pending train dl) | (pending train dl) |
 
-**Correction × Qwen2.5-Coder-32B-Instruct insight (+0.78pp):**
-- 38 exec_errors went in. Retry produced: **12 → correct**, 7 → still exec_error, 19 → "wrong" (runnable but semantically wrong).
-- 32% rescue rate on the addressable bucket — matches the agent's pre-run prediction.
-- Strategy's ceiling shrinks fast as base models get cleaner (7B had 150 exec_errors; 30B-Coder-MoE has just 25). On the strongest base, correction can move at most ~+0.5pp. **It's a "sanity-check the cheap retry" strategy, not a hill-climbing lever.**
+**Insights from the cells we have so far:**
+
+- **Correction is a sanity-check strategy, not a hill-climbing lever.** On 32B-Coder-Instruct (38 exec_errors): retry rescued 12, +0.78pp. Ceiling shrinks fast as base models get cleaner — Qwen3-Coder-MoE has only 25 exec_errors → max +1.6pp possible.
+- **CoT regresses on coder-tuned models.** Qwen2.5-Coder-32B-Instruct: -2.42pp; Qwen3-Coder-30B-A3B-Instruct: -1.89pp. Forcing a natural-language plan stage hurts models that are post-trained to go directly to SQL — the plan is brittle (coder models don't reason in NL as cleanly as in code), and the SQL stage second-guesses itself. exec_error went *up* from 38 → 49 on Qwen2.5-Coder, confirming added confusion. **Implication: CoT is the wrong tool for coder-instruct bases. It would likely help Qwen3-32B-thinking (general-tuned) but we already get that "for free" via thinking mode.**
 
 ### Combined best
 _pending — once we know which strategies move the needle, layer the winners_
