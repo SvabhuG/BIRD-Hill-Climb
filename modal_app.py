@@ -218,7 +218,7 @@ def fix_train_layout() -> dict:
     image=gpu_image,
     gpu="B200",
     volumes={HF_HOME: hf_cache, BIRD_ROOT: bird_data},
-    timeout=60 * 60,
+    timeout=2 * 60 * 60,  # 2h: voting (n=8) on thinking models can exceed 1h
     scaledown_window=300,
 )
 class Inference:
