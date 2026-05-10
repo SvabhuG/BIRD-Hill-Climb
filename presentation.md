@@ -81,7 +81,7 @@ Each strategy implemented in an isolated worktree by an autonomous subagent, com
 | voting (n=8) | **58.15%** (+0.78) | **61.08%** (+0.45) | _running_ |
 | correction | **58.15%** (+0.78) | **61.54%** (+0.91) | **52.09%** (+0.40) |
 | CoT | **54.95%** (-2.42) ⬇ | **58.74%** (-1.89) ⬇ | **50.07%** (-1.62) ⬇ |
-| fewshot (k=4) | **57.89%** (+0.52) | **59.52%** (-1.11) ⬇ | _running_ |
+| fewshot (k=4) | **57.89%** (+0.52) | **59.52%** (-1.11) ⬇ | **54.76%** (+3.07) ⬆⬆ |
 
 **Insights from the cells we have so far:**
 
@@ -89,7 +89,12 @@ Each strategy implemented in an isolated worktree by an autonomous subagent, com
 - **Voting trims exec_errors but doesn't unlock semantic fixes.** +0.78pp on Qwen2.5-Coder-32B (exec_err 38 → 7), +0.45pp on Qwen3-Coder-MoE (exec_err 25 → 13). Same mechanism as correction: result-set vote naturally filters broken candidates. Above the exec_error floor, n=8 sampling adds noise that mostly cancels out on confident greedy bases.
 - **CoT regresses on coder-tuned models.** Qwen2.5-Coder-32B: -2.42pp; Qwen3-Coder-MoE: -1.89pp. Forcing a natural-language plan stage hurts models post-trained to go directly to SQL — the plan is brittle (coder models don't reason in NL as cleanly as in code), and the SQL stage second-guesses itself. exec_error went *up* from 38 → 49 on Qwen2.5-Coder, confirming added confusion. **Implication: CoT is the wrong tool for coder-instruct bases.**
 - **Schema linking initially regressed (-0.9pp / -3.2pp / -1.1pp) — but the cause was a bug in our pipeline, not the strategy itself.** Linker recall was excellent (97.8%); the SQL generator just couldn't use the filtered schema. **Failure-mode dive (compare with `compare_runs.py` + a transition-matrix analysis on q3cm)** revealed that 75 of the 101 "broke_it" cases had perfect linker recall — the linker was *not* dropping needed columns. Looking at predicted SQL on those cases: the model was inventing column names like `FreeMealCountK12` instead of `` `Free Meal Count (K-12)` ``. The bug was in `restrict_schema → _column_def`: it emitted column names raw without backticks, so multi-word columns produced invalid DDL. The model "fixed" the malformed DDL by inventing identifier names that don't exist → exec_error. **One-line fix (always backtick-quote identifiers in restricted DDL); re-running the 3 linking cells.** This is the highest-leverage finding of the matrix run: *linker recall ≠ linking helping EX*, the prompt-rendering layer matters as much as the column-selection logic.
-- **The strongest pattern in the matrix: strategies behave differently as base strength grows.** On Qwen2.5-Coder-32B-Instruct (baseline 57.37%), 4 of 5 strategies help: linking +0.45, voting +0.78, correction +0.78, fewshot +0.52, CoT –2.42. On Qwen3-Coder-30B-A3B-Instruct (baseline 60.63%), only 2 of 5 help: voting +0.45, correction +0.91; linking –1.37, fewshot –1.11, CoT –1.89. **Stronger bases extract less from "modify the prompt" strategies and rely on "repair" strategies for what little they leave on the table.** Translates to: as we get to stronger bases, the way to climb further is *training* (RL) or a *better base*, not better prompts.
+- **The strongest pattern in the matrix: which strategies help depends on the base.**
+  - On **Qwen2.5-Coder-32B-Instruct** (57.37%), 4 of 5 strategies help: linking +0.45, voting +0.78, correction +0.78, fewshot +0.52, CoT –2.42. (Older-gen coder benefits broadly from scaffolding.)
+  - On **Qwen3-Coder-MoE** (60.63%, the leader), only 2 of 5 help: voting +0.45, correction +0.91; everything else regresses. Strongest base → strategies leave little on the table.
+  - On **Qwen3-32B (dense, thinking, general)** (51.69%), correction +0.40 and **fewshot +3.07** ← biggest single-strategy lift in the matrix. The general (non-coder) thinking model has a domain gap that few-shot examples actually fill, while the coder bases already have those patterns baked in.
+- **Punchline:** "what helps" is not a property of the strategy; it's a property of the base × strategy interaction. Repair strategies (correction, voting) are the most universally positive. Modify-the-prompt strategies (linking, CoT, fewshot) are *specific*: linking and fewshot help weaker / non-coder bases; CoT hurts every coder base we tried.
+- **Implication:** as we get to stronger coder bases, the way to climb further is *training* (RL on execution rewards) or a *better base*, not better prompts.
 
 ### Combined best
 _pending — once we know which strategies move the needle, layer the winners_
