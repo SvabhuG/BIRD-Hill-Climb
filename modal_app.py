@@ -600,3 +600,657 @@ def run_with_linking(
     summary["linking_recall_perfect"] = perfect
     print(json.dumps(summary, indent=2))
     print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+# ============================================================
+# Candidate execution (CPU, parallel processes) — voting+correction
+# ============================================================
+
+# Cap on rows we round-trip back from Pass-2 to the orchestrator. The hash is
+# already-fixed-size (SHA-1 of canonical-sorted rows), so for voting we only
+# need enough raw rows to (a) compute the hash and (b) decide is_degenerate.
+# 200 rows × 8 candidates × 1534 questions ~= 2.5M tuples, well under any RPC
+# limit even with wide schemas. Hashing is done on the worker, but we keep the
+# (capped) raw rows on the wire so the orchestrator can re-hash after the
+# correction-retry replaces a candidate (no second execute round-trip needed).
+_RESULT_ROW_CAP = 200
+
+
+def _exec_candidate_worker(job):
+    """Module-level worker: execute one SQL on one DB.
+
+    Returns {sql, results, error} where:
+      - results is a row-capped projection of the raw rows (hashing is
+        sort-based and stable under projection only when rows are LIMIT'd in
+        SQL; here we project AFTER fetch so the hash WILL differ from a true
+        full result. We accept that — the cap is generous enough that real
+        BIRD answers fit, and questions whose result-set exceeds 200 rows are
+        rare. Voting groups capped-vs-capped; correctness is judged elsewhere
+        by `evaluate_predictions` with the FULL gold execution.)
+    """
+    import sqlite3
+    from bird.eval import _execute
+
+    sql, db_path, timeout_s, row_cap = job
+    if not sql or not sql.strip():
+        return {"sql": sql, "results": [], "error": "empty_sql"}
+    try:
+        rows = _execute(db_path, sql, timeout_s=timeout_s)
+    except sqlite3.OperationalError as e:
+        msg = str(e)
+        # Distinguish timeout from other operational errors so the corrector
+        # knows whether re-running with a different shape might help at all.
+        kind = "timeout" if "interrupt" in msg.lower() else "operational"
+        return {"sql": sql, "results": [], "error": f"{kind}: {msg}"}
+    except Exception as e:
+        return {"sql": sql, "results": [], "error": repr(e)}
+
+    if row_cap and len(rows) > row_cap:
+        rows = rows[:row_cap]
+    # Convert each row to a tuple of primitives for JSON-serializability.
+    return {"sql": sql, "results": [list(r) for r in rows], "error": None}
+
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    cpu=8,
+    timeout=60 * 30,
+)
+def _execute_candidates(
+    split: str,
+    candidate_lists: list[list[str]],
+    metas: list[dict],
+    timeout_s: float = 15.0,
+    workers: int = 8,
+    row_cap: int = _RESULT_ROW_CAP,
+) -> list[list[dict]]:
+    """Execute every candidate on its question's DB; return per-task lists.
+
+    Output shape: aligned with `candidate_lists`. Each inner list has the same
+    length as the corresponding candidate list, with each entry a dict
+    {sql, results, error}. Raw `results` are projected to `row_cap` rows.
+    """
+    import multiprocessing as mp
+
+    split_root = Path(BIRD_ROOT) / split
+    db_dir = split_root / f"{split}_databases"
+
+    # Flatten with (task_idx, cand_idx) bookkeeping so we can scatter to a pool
+    # and gather back into the per-task shape.
+    flat_jobs: list[tuple[str, str, float, int]] = []
+    flat_addr: list[tuple[int, int]] = []
+    for ti, (cand_list, meta) in enumerate(zip(candidate_lists, metas)):
+        db_path = str(db_dir / meta["db_id"] / f'{meta["db_id"]}.sqlite')
+        for ci, sql in enumerate(cand_list):
+            flat_jobs.append((sql, db_path, timeout_s, row_cap))
+            flat_addr.append((ti, ci))
+
+    t0 = time.time()
+    if workers <= 1:
+        flat_out = [_exec_candidate_worker(j) for j in flat_jobs]
+    else:
+        with mp.get_context("spawn").Pool(workers) as pool:
+            flat_out = list(pool.imap(_exec_candidate_worker, flat_jobs, chunksize=8))
+    print(f"[exec-cand] executed {len(flat_out)} candidates in {time.time() - t0:.1f}s")
+
+    # Re-shape into per-task lists.
+    by_task: list[list[dict]] = [[None] * len(c) for c in candidate_lists]  # type: ignore[list-item]
+    for (ti, ci), out in zip(flat_addr, flat_out):
+        by_task[ti][ci] = out
+    return by_task
+
+
+# ============================================================
+# Voting + within-vote correction (orchestrator)
+# ============================================================
+
+@app.local_entrypoint()
+def run_with_voting_correction(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    n_samples_schema: int = 3,
+    n_votes: int = 8,
+    temperature: float = 0.7,
+    retry_temperature: float = 0.0,
+    max_tokens: int = 1024,
+    exec_timeout_s: float = 15.0,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+    eval_timeout_s: float = 30.0,
+):
+    """Composed strategy: maj@k voting + within-vote self-correction retry.
+
+    Four passes per question:
+
+      1. Sample n_votes candidates at temperature>0.
+      2. Execute every candidate on its SQLite DB (CPU pool, 15s timeout).
+      3. For each (task, candidate) whose error is not None, build a *short*
+         self-correct prompt (original user content + failed SQL + error;
+         no full schema re-render) and retry at retry_temperature. Replace
+         the failed candidate in place with the corrected one (if its execution
+         is now successful OR if we couldn't get any better).
+      4. Vote per task with `pick_winner` (degenerate-aware refinement: drop
+         degenerate result-sets only if non-degenerate are the strict majority).
+
+    Defaults target Qwen3-Coder-30B-A3B-Instruct (60.63% greedy baseline).
+    Expected delta: roughly +1.0pp over voting alone, +1.5pp over correction
+    alone (the strategies overlap on different failure modes).
+    """
+    # Local-only import: the orchestrator needs these to reshape candidates and
+    # build retry messages. modal CLI's venv has these (they ship with `bird`).
+    from bird.voting_correction import (
+        build_self_correct_user_prompt, pick_winner,
+    )
+
+    print(f"[orchestrator] preparing prompts for split={split}, limit={limit or 'all'}")
+    convos, examples_meta = _prepare_local.remote(split, limit, n_samples_schema)
+    n_tasks = len(convos)
+
+    print(f"[orchestrator] {n_tasks} prompts; sampling n={n_votes} @ T={temperature} on {model}")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+
+    # ---- Pass 1: sample n_votes candidates per question ----
+    raw = inf.chat.remote(
+        convos, n=n_votes, temperature=temperature, max_tokens=max_tokens,
+    )
+    raw_completions: list[list[str]] = [list(g or []) for g in raw]
+    candidate_lists: list[list[str]] = [
+        [extract_sql(g) for g in gens] for gens in raw_completions
+    ]
+
+    # ---- Pass 2: execute every candidate, get rows + error per cell ----
+    print(f"[orchestrator] executing {n_tasks * n_votes} candidates "
+          f"(timeout={exec_timeout_s}s)")
+    all_candidates: list[list[dict]] = _execute_candidates.remote(
+        split=split,
+        candidate_lists=candidate_lists,
+        metas=examples_meta,
+        timeout_s=exec_timeout_s,
+    )
+
+    n_executable_pre = sum(
+        1 for cands in all_candidates for c in cands if c["error"] is None
+    )
+    print(f"[exec-cand] {n_executable_pre}/{n_tasks * n_votes} candidates executable pre-retry")
+
+    # ---- Pass 3: build retry prompts for failed cells; flatten for one chat call ----
+    # Original user content is the LAST message of each convo (system+user only).
+    user_contents = [c[-1]["content"] for c in convos]
+
+    retry_addrs: list[tuple[int, int]] = []  # (task_idx, cand_idx)
+    retry_msgs: list[list[dict]] = []
+    for ti, cands in enumerate(all_candidates):
+        for ci, c in enumerate(cands):
+            if c["error"] is None:
+                continue
+            # Reuse the original system prompt; rebuild user with the failure context.
+            sys_msg = convos[ti][0]
+            new_user = build_self_correct_user_prompt(
+                user_contents[ti], failed_sql=c["sql"], error=c["error"],
+            )
+            retry_msgs.append([
+                sys_msg,
+                {"role": "user", "content": new_user},
+            ])
+            retry_addrs.append((ti, ci))
+
+    n_retried = len(retry_addrs)
+    print(f"[orchestrator] {n_retried} candidate cells to retry @ T={retry_temperature}")
+
+    n_retried_rescued = 0
+    if n_retried:
+        retry_raw = inf.chat.remote(
+            retry_msgs, n=1, temperature=retry_temperature, max_tokens=max_tokens,
+        )
+        # Build per-task retry candidate lists for re-execution.
+        retry_sql_per_task: dict[int, list[tuple[int, str]]] = {}
+        for (ti, ci), gens in zip(retry_addrs, retry_raw):
+            text = gens[0] if gens else ""
+            new_sql = extract_sql(text)
+            retry_sql_per_task.setdefault(ti, []).append((ci, new_sql))
+
+        # Reassemble candidate_lists for re-execution: only the retried cells.
+        retry_task_idxs = sorted(retry_sql_per_task.keys())
+        retry_cand_lists: list[list[str]] = []
+        retry_metas: list[dict] = []
+        # Track which (cand_idx_in_subset, ti, ci_orig) so we can splice back.
+        retry_addrs_by_subset: list[list[tuple[int, int]]] = []
+        for ti in retry_task_idxs:
+            pairs = retry_sql_per_task[ti]
+            retry_cand_lists.append([sql for _, sql in pairs])
+            retry_metas.append(examples_meta[ti])
+            retry_addrs_by_subset.append([(ti, ci_orig) for ci_orig, _ in pairs])
+
+        retried_exec = _execute_candidates.remote(
+            split=split,
+            candidate_lists=retry_cand_lists,
+            metas=retry_metas,
+            timeout_s=exec_timeout_s,
+        )
+
+        # Replace-in-place: only swap if the retry actually executes; otherwise
+        # leave the original failed candidate so its error still feeds telemetry.
+        for sub_list, addr_list in zip(retried_exec, retry_addrs_by_subset):
+            for new_cand, (ti, ci) in zip(sub_list, addr_list):
+                if new_cand["error"] is None:
+                    all_candidates[ti][ci] = new_cand
+                    n_retried_rescued += 1
+                else:
+                    # Keep original failure but stamp the retry SQL for audit.
+                    # (We deliberately don't replace — a fresh failure isn't an
+                    # improvement, and it could mask an originally-recoverable
+                    # error if the retry produced an unrelated syntax error.)
+                    pass
+
+    n_executable_post = sum(
+        1 for cands in all_candidates for c in cands if c["error"] is None
+    )
+    print(f"[correct] rescued {n_retried_rescued}/{n_retried} retried candidates")
+    print(f"[exec-cand] {n_executable_post}/{n_tasks * n_votes} candidates executable post-retry")
+
+    # ---- Pass 4: vote per task ----
+    from collections import Counter as _Counter
+    predictions: list[dict] = []
+    outcome_counts: _Counter = _Counter()
+    for meta, cands in zip(examples_meta, all_candidates):
+        outcome = pick_winner(cands)
+        outcome_counts[outcome["vote_outcome"]] += 1
+        n_deg = outcome["n_degenerate"]
+        n_exec_pre_q = sum(1 for c in cands if c["error"] is None)  # post-retry, but per-question
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": outcome["winner_sql"],
+            # Per-question telemetry as a passthrough field.
+            "voting_correction_metadata": {
+                "n_candidates": n_votes,
+                "n_executable_pre_retry": None,  # filled below
+                "n_executable_post_retry": n_exec_pre_q,
+                "n_degenerate": n_deg,
+                "n_retried": None,               # filled below
+                "n_retried_rescued": None,       # filled below
+                "vote_outcome": outcome["vote_outcome"],
+                "winner_count": outcome["winner_count"],
+                "n_distinct_results": outcome["n_distinct_results"],
+                "fallback_used": outcome["fallback_used"],
+                "degenerate_filter_applied": outcome["degenerate_filter_applied"],
+            },
+        })
+
+    # Backfill the per-question pre-retry / retry counts. We tracked these
+    # globally; recompute per-question against the original candidate states.
+    # (We need to re-derive from candidate_lists vs all_candidates since
+    # all_candidates has been replaced-in-place.)
+    # Build the pre-retry exec map from a separate count pass on candidate_lists
+    # would re-execute everything; instead, derive from the retry_addrs we stored.
+    retried_per_task: dict[int, int] = {}
+    rescued_per_task: dict[int, int] = {}
+    if n_retried:
+        # Need the same scope as the retry block above.
+        for (ti, _ci) in retry_addrs:
+            retried_per_task[ti] = retried_per_task.get(ti, 0) + 1
+        # Recount rescued by checking for each retried (ti, ci): is it now error-free?
+        # We don't have the retry subsets in scope here; inline a quick pass.
+        # all_candidates[ti][ci].error is None AND (ti, ci) was in retry_addrs => rescued.
+        retry_set = set(retry_addrs)
+        for ti, ci in retry_set:
+            if all_candidates[ti][ci]["error"] is None:
+                rescued_per_task[ti] = rescued_per_task.get(ti, 0) + 1
+
+    for ti, p in enumerate(predictions):
+        meta = p["voting_correction_metadata"]
+        post = meta["n_executable_post_retry"]
+        n_ret_q = retried_per_task.get(ti, 0)
+        n_resc_q = rescued_per_task.get(ti, 0)
+        # Pre-retry executable = post-retry executable - rescued.
+        meta["n_retried"] = n_ret_q
+        meta["n_retried_rescued"] = n_resc_q
+        meta["n_executable_pre_retry"] = post - n_resc_q
+
+    print(f"[vote] outcomes: {dict(outcome_counts)}")
+
+    save_tag = save_as or (
+        f"voting-correction-{Path(model).name}-{split}-n{n_votes}-{int(time.time())}.json"
+    )
+    print("[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag,
+        timeout_s=eval_timeout_s,
+    )
+    summary["voting_correction"] = {
+        "n_votes": n_votes,
+        "temperature": temperature,
+        "retry_temperature": retry_temperature,
+        "n_executable_pre_retry": n_executable_pre,
+        "n_executable_post_retry": n_executable_post,
+        "n_retried": n_retried,
+        "n_retried_rescued": n_retried_rescued,
+        "vote_outcomes": dict(outcome_counts),
+    }
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+# ============================================================
+# Stacked voting+correction (B + R2 + R3) — orchestrator
+# ============================================================
+
+@app.local_entrypoint()
+def run_with_stacked(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    n_samples_schema: int = 3,
+    n_diverse: int = 7,                # diversity samples added per escalated question
+    greedy_temperature: float = 0.0,
+    correction_temperature: float = 0.2,
+    diversity_temperature: float = 0.7,
+    retry_temperature: float = 0.0,
+    max_tokens: int = 1024,
+    exec_timeout_s: float = 15.0,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+    eval_timeout_s: float = 30.0,
+):
+    """Stacked voting+correction: confidence-escalation + greedy anchor + rescued tie-break.
+
+    Pipeline:
+      A.   Greedy (T=0.0, n=1) — most questions stop here.
+      A.5. For exec_error greedy, one retry at T=correction_temperature (default 0.2).
+      B.   Route via should_escalate: if greedy succeeded with non-degenerate
+           result, register as final. Otherwise escalate.
+      C.   For escalated questions: sample n_diverse more candidates at
+           diversity_temperature. Greedy_corrected is candidate-0 (is_greedy=True).
+      D.   Within-vote retry on errored diverse candidates at retry_temperature
+           (default 0.0). Tag rescued ones rescued=True.
+      E.   pick_winner_stacked per escalated question with R2 (greedy anchor)
+           + R3 (rescued can't outvote originals) + strict-override.
+
+    Telemetry per question (in `stacked_metadata`) lets us split EX by:
+      - route:                    "greedy_only" | "escalated"
+      - kept_greedy (escalated):  True/False
+      - degenerate_filter_applied
+    """
+    # Local-only imports — orchestrator-side.
+    from bird.voting_correction import build_self_correct_user_prompt
+    from bird.voting_correction_stacked import (
+        pick_winner_stacked,
+        should_escalate,
+    )
+
+    print(f"[orchestrator] preparing prompts for split={split}, limit={limit or 'all'}")
+    convos, examples_meta = _prepare_local.remote(split, limit, n_samples_schema)
+    n_tasks = len(convos)
+
+    print(f"[orchestrator] {n_tasks} prompts; greedy pass on {model} (T={greedy_temperature})")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+
+    # ---- Stage A: greedy ----
+    raw_greedy = inf.chat.remote(
+        convos, n=1, temperature=greedy_temperature, max_tokens=max_tokens,
+    )
+    greedy_sqls: list[str] = [
+        extract_sql((gens[0] if gens else "")) for gens in raw_greedy
+    ]
+    greedy_raw: list[str] = [(gens[0] if gens else "") for gens in raw_greedy]
+
+    print(f"[orchestrator] executing {n_tasks} greedy candidates (timeout={exec_timeout_s}s)")
+    greedy_exec_lists: list[list[dict]] = _execute_candidates.remote(
+        split=split,
+        candidate_lists=[[s] for s in greedy_sqls],
+        metas=examples_meta,
+        timeout_s=exec_timeout_s,
+    )
+    greedy_exec: list[dict] = [lst[0] for lst in greedy_exec_lists]
+
+    # ---- Stage A.5: correction retry on exec_errors ----
+    user_contents = [c[-1]["content"] for c in convos]
+
+    a5_addrs: list[int] = []   # task indices that need correction retry
+    a5_msgs: list[list[dict]] = []
+    for ti, c in enumerate(greedy_exec):
+        if c["error"] is None:
+            continue
+        sys_msg = convos[ti][0]
+        new_user = build_self_correct_user_prompt(
+            user_contents[ti], failed_sql=c["sql"], error=c["error"],
+        )
+        a5_msgs.append([sys_msg, {"role": "user", "content": new_user}])
+        a5_addrs.append(ti)
+
+    n_a5 = len(a5_addrs)
+    print(f"[orchestrator] {n_a5} greedy exec_errors -> correction retry @ T={correction_temperature}")
+    n_a5_rescued = 0
+    if n_a5:
+        a5_raw = inf.chat.remote(
+            a5_msgs, n=1, temperature=correction_temperature, max_tokens=max_tokens,
+        )
+        a5_sqls: list[str] = [extract_sql((gens[0] if gens else "")) for gens in a5_raw]
+
+        a5_exec_lists: list[list[dict]] = _execute_candidates.remote(
+            split=split,
+            candidate_lists=[[s] for s in a5_sqls],
+            metas=[examples_meta[ti] for ti in a5_addrs],
+            timeout_s=exec_timeout_s,
+        )
+        for ti, new_lst, new_sql in zip(a5_addrs, a5_exec_lists, a5_sqls):
+            new = new_lst[0]
+            # Always overwrite to reflect "greedy corrected" — even if still
+            # errored, the new SQL is our best greedy-only candidate. Routing
+            # will then escalate this question regardless.
+            greedy_exec[ti] = new
+            greedy_sqls[ti] = new_sql
+            if new["error"] is None:
+                n_a5_rescued += 1
+    print(f"[correct] greedy retry rescued {n_a5_rescued}/{n_a5}")
+
+    # ---- Stage B: routing ----
+    needs_escalation: list[int] = [
+        ti for ti, c in enumerate(greedy_exec) if should_escalate(c)
+    ]
+    n_escalated = len(needs_escalation)
+    print(f"[route] {n_escalated}/{n_tasks} questions escalated ({n_escalated / max(n_tasks, 1):.1%})")
+
+    # Initialize final outputs: greedy_corrected for everyone; will be replaced
+    # in the escalated branch.
+    final_sqls: list[str] = list(greedy_sqls)
+    stacked_metadata: list[dict] = [
+        {
+            "route": "greedy_only",
+            "greedy_sql_executable": (greedy_exec[ti]["error"] is None),
+            "greedy_degenerate": False,  # by definition of route=greedy_only
+            "n_candidates": 1,
+            "kept_greedy": True,
+            "vote_outcome": "greedy_only",
+        }
+        for ti in range(n_tasks)
+    ]
+
+    if n_escalated:
+        # ---- Stage C: sample n_diverse diverse candidates per escalated question ----
+        esc_convos = [convos[ti] for ti in needs_escalation]
+        esc_metas = [examples_meta[ti] for ti in needs_escalation]
+        print(f"[orchestrator] sampling n_diverse={n_diverse} @ T={diversity_temperature} on {n_escalated} questions")
+        esc_raw = inf.chat.remote(
+            esc_convos, n=n_diverse, temperature=diversity_temperature,
+            max_tokens=max_tokens,
+        )
+        # candidate_lists for the escalated subset — n_diverse SQLs per question.
+        esc_cand_sqls: list[list[str]] = [
+            [extract_sql(g) for g in (gens or [])] for gens in esc_raw
+        ]
+
+        print(f"[orchestrator] executing {n_escalated * n_diverse} diverse candidates")
+        esc_cand_exec: list[list[dict]] = _execute_candidates.remote(
+            split=split,
+            candidate_lists=esc_cand_sqls,
+            metas=esc_metas,
+            timeout_s=exec_timeout_s,
+        )
+
+        # ---- Stage D: within-vote retry on errored diverse candidates ----
+        d_addrs: list[tuple[int, int]] = []   # (esc_idx, cand_idx)
+        d_msgs: list[list[dict]] = []
+        for ei, cands in enumerate(esc_cand_exec):
+            ti = needs_escalation[ei]
+            sys_msg = convos[ti][0]
+            user_content = user_contents[ti]
+            for ci, c in enumerate(cands):
+                if c["error"] is None:
+                    continue
+                new_user = build_self_correct_user_prompt(
+                    user_content, failed_sql=c["sql"], error=c["error"],
+                )
+                d_msgs.append([sys_msg, {"role": "user", "content": new_user}])
+                d_addrs.append((ei, ci))
+
+        n_d = len(d_addrs)
+        print(f"[orchestrator] {n_d} diverse exec_errors -> within-vote retry @ T={retry_temperature}")
+
+        # Rescued mask: parallel to esc_cand_exec, defaults False.
+        rescued_mask: list[list[bool]] = [
+            [False] * len(cands) for cands in esc_cand_exec
+        ]
+        n_d_rescued = 0
+        if n_d:
+            d_raw = inf.chat.remote(
+                d_msgs, n=1, temperature=retry_temperature, max_tokens=max_tokens,
+            )
+            d_sqls = [extract_sql((gens[0] if gens else "")) for gens in d_raw]
+
+            # Group retries by escalated-question index for batched execution.
+            d_by_ei: dict[int, list[tuple[int, str]]] = {}
+            for (ei, ci), new_sql in zip(d_addrs, d_sqls):
+                d_by_ei.setdefault(ei, []).append((ci, new_sql))
+
+            d_eis = sorted(d_by_ei.keys())
+            d_cand_lists = [[s for _, s in d_by_ei[ei]] for ei in d_eis]
+            d_metas_subset = [esc_metas[ei] for ei in d_eis]
+
+            d_exec = _execute_candidates.remote(
+                split=split,
+                candidate_lists=d_cand_lists,
+                metas=d_metas_subset,
+                timeout_s=exec_timeout_s,
+            )
+
+            for ei, sub_exec in zip(d_eis, d_exec):
+                pairs = d_by_ei[ei]
+                for (ci_orig, _new_sql), new_cand in zip(pairs, sub_exec):
+                    if new_cand["error"] is None:
+                        esc_cand_exec[ei][ci_orig] = new_cand
+                        rescued_mask[ei][ci_orig] = True
+                        n_d_rescued += 1
+        print(f"[correct] within-vote retry rescued {n_d_rescued}/{n_d}")
+
+        # ---- Stage E: pick_winner_stacked per escalated question ----
+        from collections import Counter as _Counter
+        vote_outcome_counts: _Counter = _Counter()
+        kept_greedy_count = 0
+        vote_overrode_count = 0
+        for ei, ti in enumerate(needs_escalation):
+            # Assemble the pool: greedy_corrected as candidate-0, then n_diverse
+            # diverse candidates (post-rescue).
+            pool: list[dict] = []
+            pool.append({
+                "sql": greedy_sqls[ti],
+                "results": greedy_exec[ti].get("results") or [],
+                "error": greedy_exec[ti]["error"],
+                "rescued": False,
+                "is_greedy": True,
+            })
+            for ci, c in enumerate(esc_cand_exec[ei]):
+                pool.append({
+                    "sql": c["sql"],
+                    "results": c.get("results") or [],
+                    "error": c["error"],
+                    "rescued": rescued_mask[ei][ci],
+                    "is_greedy": False,
+                })
+
+            out = pick_winner_stacked(pool)
+            vote_outcome_counts[out["vote_outcome"]] += 1
+            final_sqls[ti] = out["winner_sql"]
+            if out["kept_greedy"]:
+                kept_greedy_count += 1
+            else:
+                vote_overrode_count += 1
+            stacked_metadata[ti] = {
+                "route": "escalated",
+                "greedy_sql_executable": (greedy_exec[ti]["error"] is None),
+                "greedy_degenerate": (
+                    greedy_exec[ti]["error"] is None
+                    and should_escalate(greedy_exec[ti])
+                ),
+                "n_candidates": len(pool),
+                "n_executable_pre_retry": out["n_executable_pre_retry"],
+                "n_executable_post_retry": out["n_executable_post_retry"],
+                "n_degenerate": out["n_degenerate"],
+                "n_rescued": out["n_rescued"],
+                "winning_bucket_size": out["winning_bucket_size"],
+                "greedy_bucket_size": out["greedy_bucket_size"],
+                "kept_greedy": out["kept_greedy"],
+                "vote_outcome": out["vote_outcome"],
+                "degenerate_filter_applied": out["degenerate_filter_applied"],
+                "fallback_used": out["fallback_used"],
+            }
+        print(f"[vote] escalated outcomes: {dict(vote_outcome_counts)}")
+        print(f"[vote] kept_greedy={kept_greedy_count} vote_overrode={vote_overrode_count}")
+    else:
+        kept_greedy_count = 0
+        vote_overrode_count = 0
+        vote_outcome_counts = {}
+
+    # ---- Build predictions ----
+    predictions: list[dict] = []
+    for ti, meta in enumerate(examples_meta):
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": final_sqls[ti],
+            "stacked_metadata": stacked_metadata[ti],
+        })
+
+    save_tag = save_as or (
+        f"stacked-{Path(model).name}-{split}-d{n_diverse}-{int(time.time())}.json"
+    )
+    print("[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag,
+        timeout_s=eval_timeout_s,
+    )
+    summary["stacked"] = {
+        "n_tasks": n_tasks,
+        "n_escalated": n_escalated,
+        "escalation_rate": n_escalated / max(n_tasks, 1),
+        "n_greedy_correction_rescued": n_a5_rescued,
+        "n_greedy_correction_attempted": n_a5,
+        "n_within_vote_rescued": n_d_rescued if n_escalated else 0,
+        "n_within_vote_attempted": n_d if n_escalated else 0,
+        "kept_greedy": kept_greedy_count,
+        "vote_overrode_greedy": vote_overrode_count,
+        "vote_outcomes": dict(vote_outcome_counts),
+        "greedy_temperature": greedy_temperature,
+        "correction_temperature": correction_temperature,
+        "diversity_temperature": diversity_temperature,
+        "retry_temperature": retry_temperature,
+        "n_diverse": n_diverse,
+    }
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
