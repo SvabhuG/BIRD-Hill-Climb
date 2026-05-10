@@ -40,7 +40,8 @@
       "results": {
         "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5815, "delta": 0.0078, "exec_error": 7},
         "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.6108, "delta": 0.0045, "exec_error": 13},
-        "Qwen3-32B (thinking)":        {"ex": null,   "delta": null,   "note": "in flight — n=8 thinking is the slowest cell, ~80min"}
+        "Qwen3-Coder-30B-A3B-Instruct (T=1.0)":{"ex": 0.6076, "delta": 0.0013, "exec_error": 13, "note": "DIAGNOSTIC: bumped to T=1.0 to test MoE-expert-diversity hypothesis. RESULT: WORSE than T=0.6 (+0.13 vs +0.45). Voting on this base is bounded by model capability, not sampling diversity. R1 hypothesis falsified."},
+        "Qwen3-32B (thinking, v2)":    {"ex": null,   "delta": null,   "note": "in flight — v2 re-run after the v1 hit 1h Modal timeout; 2h cap now"}
       }
     },
 
