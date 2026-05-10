@@ -84,6 +84,7 @@
     "branch": "feat/stacked-voting-correction (commit c8d2cd7)",
     "description": "Composed strategy: greedy correction first; only escalate to voting+correction if greedy errored OR returned degenerate result. Inside voting: greedy is candidate-0 (R2: strict-override only), rescued candidates can't outvote originally-valid ones (R3).",
     "results": {
+      "Qwen2.5-Coder-32B-Instruct": {"ex": 0.5867, "delta": 0.0130, "escalation_rate": 0.069, "kept_greedy": 93, "vote_overrode": 13, "note": "STACKING GAIN: +0.52pp over either voting alone OR correction alone (+0.78). Older-gen base has more diversity-at-T=0.7 → voting finds 13 legitimate corrections greedy missed."},
       "Qwen3-Coder-30B-A3B-Instruct": {"ex": 0.6121, "delta": 0.0058, "escalation_rate": 0.066, "kept_greedy": 93, "vote_overrode": 8, "note": "Worked as engineered; 6.6% escalation; vote rarely overrides greedy. Below correction-alone (+0.91pp). Voting itself has near-zero marginal value on this confident base."},
       "Qwen3.6-27B": {"note": "in flight"}
     }
