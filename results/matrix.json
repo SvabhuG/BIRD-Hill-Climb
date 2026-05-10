@@ -29,7 +29,8 @@
       "results": {
         "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5782, "delta": 0.0045,  "exec_error": 30, "linker_recall": 0.9783, "tag": "linking-q25c32bi-v3"},
         "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.5926, "delta": -0.0137, "exec_error": 28, "linker_recall": 0.9750, "tag": "linking-q3cm-v2"},
-        "Qwen3-32B (thinking)":        {"ex": 0.5046, "delta": -0.0123, "exec_error": 33, "linker_recall": 0.9481, "tag": "linking-q332-v2"}
+        "Qwen3-32B (thinking)":        {"ex": 0.5046, "delta": -0.0123, "exec_error": 33, "linker_recall": 0.9481, "tag": "linking-q332-v2"},
+        "Qwen3.6-27B":                 {"ex": 0.5913, "delta": -0.0417, "exec_error": 81, "linker_recall": 0.9544, "note": "biggest regression in matrix; exec_error 18 -> 81. Most confident base, most disrupted by filtered DDL."}
       }
     },
 
@@ -49,7 +50,8 @@
       "results": {
         "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5815, "delta": 0.0078, "rescued": 12, "of_exec_error": 38, "exec_error": 7},
         "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.6154, "delta": 0.0091, "rescued": 14, "of_exec_error": 26, "exec_error": 8},
-        "Qwen3-32B (thinking)":        {"ex": 0.5209, "delta": 0.0040, "rescued": 6,  "of_exec_error": 23, "exec_error": 3}
+        "Qwen3-32B (thinking)":        {"ex": 0.5209, "delta": 0.0040, "rescued": 6,  "of_exec_error": 23, "exec_error": 3},
+        "Qwen3.6-27B":                 {"ex": 0.6330, "delta": 0.0000, "rescued": 7,  "of_exec_error": 21, "exec_error": 14, "note": "correction floor — Qwen3.6 has so few exec_errors (~18-21) that rescuing them just hits baseline; no semantic-wrong gains possible from this strategy"}
       }
     },
 
@@ -71,7 +73,8 @@
       "results": {
         "Qwen2.5-Coder-32B-Instruct":  {"ex": 0.5789, "delta": 0.0052, "exec_error": 33},
         "Qwen3-Coder-30B-A3B-Instruct":{"ex": 0.5952, "delta": -0.0111,"exec_error": 29},
-        "Qwen3-32B (thinking)":        {"ex": 0.5476, "delta": 0.0307, "exec_error": 19, "note": "biggest single-strategy lift in the matrix; non-coder thinking model has SQL-pattern gap that shots fill"}
+        "Qwen3-32B (thinking)":        {"ex": 0.5476, "delta": 0.0307, "exec_error": 19, "note": "biggest single-strategy lift on Qwen3-32B; non-coder thinking model has SQL-pattern gap that shots fill"},
+        "Qwen3.6-27B":                 {"ex": 0.6291, "delta": -0.0039, "exec_error": 14, "note": "PREDICTION WRONG. Predicted +1-2.5pp based on Q3-32B-thinking +3.07pp pattern; actual is -0.39pp. Fewshot's value diminishes faster than expected as base strength grows."}
       }
     }
   },
