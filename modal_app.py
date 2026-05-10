@@ -63,14 +63,21 @@ gpu_image = (
     # rllm-org/rllm#388). Older vllm + newer transformers, OR newer vllm + older
     # transformers, both break — only this paired version works.
     .pip_install(
-        "vllm==0.11.0",
-        "transformers==4.57.0",
+        "vllm==0.20.2",
+        "transformers==5.8.0",
         "tqdm",
         "pydantic>=2",
         "sqlglot>=25",
         "huggingface_hub",
     )
-    .env({"HF_HOME": HF_HOME, "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({
+        "HF_HOME": HF_HOME,
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        # Qwen3.6's gated-delta-net layers trigger DeepGEMM which isn't bundled
+        # in the vllm wheel and has accuracy issues on Blackwell — disable.
+        "VLLM_USE_DEEP_GEMM": "0",
+        "VLLM_USE_DEEP_GEMM_E8M0": "0",
+    })
     .pip_install("hf_transfer")
     .add_local_python_source("bird")
 )
@@ -225,6 +232,9 @@ class Inference:
     model_name: str = modal.parameter(default="Qwen/Qwen2.5-Coder-7B-Instruct")
     tensor_parallel_size: int = modal.parameter(default=1)
     max_model_len: int = modal.parameter(default=16384)
+    # FLASH_ATTN avoids flashinfer's JIT-compile step (needs nvcc + CCCL we
+    # don't ship). Required for Qwen3.6 + vllm 0.20+ on B200.
+    attention_backend: str = modal.parameter(default="FLASH_ATTN")
 
     @modal.enter()
     def _load(self):
@@ -237,6 +247,7 @@ class Inference:
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             download_dir=HF_HOME,
+            attention_backend=self.attention_backend or None,
         )
         print(f"[inference] loaded {self.model_name} in {time.time() - t0:.1f}s")
 

@@ -39,11 +39,12 @@ class VLLMEngine:
         enable_prefix_caching: bool = True,
         download_dir: str | None = None,
         trust_remote_code: bool = True,
+        attention_backend: str | None = None,
     ):
         from vllm import LLM  # noqa: WPS433  (lazy import on purpose)
 
         self.model = model
-        self._llm = LLM(
+        kwargs: dict = dict(
             model=model,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
@@ -53,6 +54,10 @@ class VLLMEngine:
             download_dir=download_dir,
             trust_remote_code=trust_remote_code,
         )
+        if attention_backend:
+            from vllm.config import AttentionConfig
+            kwargs["attention_config"] = AttentionConfig(backend=attention_backend)
+        self._llm = LLM(**kwargs)
 
     def chat(self, conversations: Sequence[list[dict]], cfg: GenConfig) -> list[GenOutput]:
         """Run a batch of chat-message lists through vLLM.
