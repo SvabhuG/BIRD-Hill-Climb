@@ -37,6 +37,9 @@ APP_NAME = "bird-climb"
 bird_data = modal.Volume.from_name("bird-data", create_if_missing=True)
 hf_cache = modal.Volume.from_name("hf-cache", create_if_missing=True)
 results_vol = modal.Volume.from_name("bird-results", create_if_missing=True)
+sft_checkpoints = modal.Volume.from_name("bird-sft-checkpoints", create_if_missing=True)
+
+SFT_CHECKPOINTS_ROOT = "/checkpoints"
 
 BIRD_ROOT = "/data/bird"          # mount path for bird-data
 HF_HOME = "/root/.cache/hf"       # mount path for hf-cache
@@ -217,7 +220,7 @@ def fix_train_layout() -> dict:
 @app.cls(
     image=gpu_image,
     gpu="B200",
-    volumes={HF_HOME: hf_cache, BIRD_ROOT: bird_data},
+    volumes={HF_HOME: hf_cache, BIRD_ROOT: bird_data, SFT_CHECKPOINTS_ROOT: sft_checkpoints},
     timeout=2 * 60 * 60,  # 2h: voting (n=8) on thinking models can exceed 1h
     scaledown_window=300,
 )
