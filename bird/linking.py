@@ -329,14 +329,19 @@ def restrict_schema(schema: DatabaseSchema, selection: Selection) -> DatabaseSch
         kept_samples = [tuple(row[i] for i in col_idx) for row in t.sample_rows]
 
         # Re-render a minimal CREATE TABLE so the prompt's DDL only shows kept cols.
+        # CRITICAL: identifiers must be backtick-quoted because BIRD column names
+        # routinely contain spaces and parens (e.g., `Free Meal Count (K-12)`).
+        # An earlier version emitted them raw, producing invalid DDL that the model
+        # "fixed" by inventing munged names (FreeMealCountK12), causing exec_errors.
         col_defs = [_column_def(c) for c in kept_cols]
         if kept_pk:
-            col_defs.append(f"PRIMARY KEY ({', '.join(kept_pk)})")
+            col_defs.append(f"PRIMARY KEY ({', '.join(_quote(p) for p in kept_pk)})")
         for fk in kept_fks:
             col_defs.append(
-                f"FOREIGN KEY ({fk.from_column}) REFERENCES {fk.to_table}({fk.to_column})"
+                f"FOREIGN KEY ({_quote(fk.from_column)}) "
+                f"REFERENCES {_quote(fk.to_table)}({_quote(fk.to_column)})"
             )
-        ddl = f"CREATE TABLE {t.name} (\n  " + ",\n  ".join(col_defs) + "\n);"
+        ddl = f"CREATE TABLE {_quote(t.name)} (\n  " + ",\n  ".join(col_defs) + "\n);"
 
         new_tables.append(TableSchema(
             name=t.name,
@@ -352,8 +357,15 @@ def restrict_schema(schema: DatabaseSchema, selection: Selection) -> DatabaseSch
     return DatabaseSchema(db_id=schema.db_id, tables=new_tables)
 
 
+def _quote(name: str) -> str:
+    """Backtick-quote a SQLite identifier. Always — backticks are safe on
+    plain names too, and BIRD column names routinely contain spaces/parens
+    that *must* be quoted (e.g., `Free Meal Count (K-12)`)."""
+    return f"`{name}`"
+
+
 def _column_def(c: ColumnInfo) -> str:
-    parts = [c.name, c.type or "TEXT"]
+    parts = [_quote(c.name), c.type or "TEXT"]
     if c.notnull:
         parts.append("NOT NULL")
     if c.default is not None:
