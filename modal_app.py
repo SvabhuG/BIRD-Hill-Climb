@@ -314,6 +314,72 @@ def evaluate_predictions(
 
 
 # ============================================================
+# Voting (CPU, parallel processes)
+# ============================================================
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    cpu=8,
+    timeout=60 * 30,
+)
+def vote_predictions(
+    split: str,
+    candidate_lists: list[list[str]],
+    metas: list[dict],
+    timeout_s: float = 15.0,
+    workers: int = 8,
+) -> list[dict]:
+    """Majority-vote-on-execution per question.
+
+    For each question, executes its candidate SQLs against the question's SQLite DB,
+    hashes each result-set, and returns the SQL whose result is the most common.
+    Returns a list aligned with `metas`: [{question_id, winner_sql, voting_metadata}].
+    """
+    import multiprocessing as mp
+
+    split_root = Path(BIRD_ROOT) / split
+    db_dir = split_root / f"{split}_databases"
+
+    # Pack work items so we can fan out to a process pool. We carry the question_id
+    # so results can be reassembled in caller order.
+    jobs: list[tuple[int, str, list[str], str, float]] = []
+    for cand_list, meta in zip(candidate_lists, metas):
+        db_path = str(db_dir / meta["db_id"] / f'{meta["db_id"]}.sqlite')
+        jobs.append((meta["question_id"], meta["db_id"], list(cand_list), db_path, timeout_s))
+
+    t0 = time.time()
+    if workers <= 1:
+        results = [_vote_worker(j) for j in jobs]
+    else:
+        # `vote` is CPU-bound (SQLite execution + hashing) — use processes for true
+        # parallelism, mirroring `evaluate_predictions`.
+        with mp.get_context("spawn").Pool(workers) as pool:
+            results = list(pool.imap(_vote_worker, jobs, chunksize=4))
+    print(f"[vote] voted on {len(results)} questions in {time.time() - t0:.1f}s")
+    return results
+
+
+def _vote_worker(job):
+    """Module-level worker so the spawn-context pool can pickle it."""
+    from bird.voting import vote
+    qid, db_id, cands, db_path, t = job
+    outcome = vote(cands, db_path, timeout_s=t)
+    return {
+        "question_id": qid,
+        "db_id": db_id,
+        "winner_sql": outcome["winner_sql"],
+        "voting_metadata": {
+            "winner_count": outcome["winner_count"],
+            "n_candidates": outcome["n_candidates"],
+            "n_executable": outcome["n_executable"],
+            "n_distinct_results": outcome["n_distinct_results"],
+            "fallback_used": outcome["fallback_used"],
+        },
+    }
+
+
+# ============================================================
 # Local orchestrator
 # ============================================================
 
@@ -543,5 +609,108 @@ def run_with_linking(
     summary = evaluate_predictions.remote(split=split, predictions=predictions, save_as=save_tag)
     summary["linking_recall_avg"] = avg_recall
     summary["linking_recall_perfect"] = perfect
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+@app.local_entrypoint()
+def run_with_voting(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    n_samples_schema: int = 3,
+    n_votes: int = 8,
+    temperature: float = 0.6,
+    max_tokens: int = 1024,
+    save_as: str = "",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+    vote_timeout_s: float = 15.0,
+    eval_timeout_s: float = 30.0,
+):
+    """Self-consistency by majority-vote-on-execution.
+
+    Per question, sample n_votes candidates at temperature>0, execute each on the
+    SQLite DB, group by canonical result-set hash, and pick the SQL whose result
+    is the most common among executable candidates. Falls back to the first
+    candidate if every sample fails to execute.
+
+    Tradeoffs vs. greedy baseline: ~n_votes x more inference cost; expected gain
+    on Qwen2.5-Coder-7B in the 2-4 EX-point range, with the bulk coming from
+    questions that are right-once-out-of-eight in the EXEC_ERROR/WRONG buckets.
+    """
+    print(f"[orchestrator] preparing prompts for split={split}, limit={limit or 'all'}")
+    convos, examples_meta = _prepare_local.remote(split, limit, n_samples_schema)
+
+    print(f"[orchestrator] {len(convos)} prompts; sampling n={n_votes} @ T={temperature} on {model}")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    raw = inf.chat.remote(
+        convos, n=n_votes, temperature=temperature, max_tokens=max_tokens,
+    )
+
+    # Extract SQL from each completion -> per-question candidate lists.
+    candidate_lists: list[list[str]] = []
+    raw_completions: list[list[str]] = []
+    for gens in raw:
+        gens = gens or []
+        raw_completions.append(gens)
+        candidate_lists.append([extract_sql(g) for g in gens])
+
+    print(f"[orchestrator] running per-question vote (timeout={vote_timeout_s}s)")
+    voted = vote_predictions.remote(
+        split=split,
+        candidate_lists=candidate_lists,
+        metas=examples_meta,
+        timeout_s=vote_timeout_s,
+    )
+
+    # Build the predictions list, attaching voting_metadata as a passthrough field.
+    by_qid = {v["question_id"]: v for v in voted}
+    predictions = []
+    n_fallback = 0
+    for meta, gens, cands in zip(examples_meta, raw_completions, candidate_lists):
+        v = by_qid[meta["question_id"]]
+        if v["voting_metadata"]["fallback_used"]:
+            n_fallback += 1
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": v["winner_sql"],
+            "raw_completions": gens,
+            "candidate_sqls": cands,
+            "voting_metadata": v["voting_metadata"],
+        })
+
+    avg_executable = (
+        sum(p["voting_metadata"]["n_executable"] for p in predictions)
+        / max(len(predictions), 1)
+    )
+    avg_winner_count = (
+        sum(p["voting_metadata"]["winner_count"] for p in predictions)
+        / max(len(predictions), 1)
+    )
+    print(
+        f"[vote] avg_executable={avg_executable:.2f}/{n_votes}  "
+        f"avg_winner_count={avg_winner_count:.2f}  fallback={n_fallback}/{len(predictions)}"
+    )
+
+    save_tag = save_as or f"voting-{Path(model).name}-{split}-n{n_votes}-{int(time.time())}.json"
+    print("[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag, timeout_s=eval_timeout_s,
+    )
+    summary["voting"] = {
+        "n_votes": n_votes,
+        "temperature": temperature,
+        "avg_executable": avg_executable,
+        "avg_winner_count": avg_winner_count,
+        "n_fallback": n_fallback,
+    }
     print(json.dumps(summary, indent=2))
     print(f"[done] saved as {save_tag} on bird-results volume")
