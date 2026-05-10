@@ -98,6 +98,23 @@
         "ci_95_full_dev_pp": 0.86,
         "note": "Largest single-strategy delta on Q3-Coder-MoE so far (+2.02pp >> correction's +0.91pp and stacked-voting-correction's +0.58pp). The routing pre-filter is what makes it work: baseline EX on the routed slice is 5.35%, so the agent only needs marginal lift to net-positive — and it delivers +16.6pp on that slice. Agent fixes 38 wrong, breaks 7 correct → 31 net. Tag: agentic-routed-q3cm-dev-187"
       }
+    },
+    "v2_ablation_keep_baseline_and_expanded_routing": {
+      "Qwen3-Coder-30B-A3B-Instruct": {
+        "ex": 0.6063,
+        "delta": 0.0000,
+        "routed_n": 256,
+        "routed_pct": 0.167,
+        "rule_breakdown": {"exec_error": 28, "degenerate": 118, "low_vote_share_threshold_0.75": 107, "t07_disagree": 76, "hint_col_missing": 7},
+        "baseline_routed_ex": 0.1367,
+        "agent_routed_ex": 0.1367,
+        "paired_contingency": {"b11_both_correct": 22, "b01_agent_only": 13, "b10_baseline_only": 13, "b00_both_wrong": 208},
+        "net_correct_delta": 0,
+        "p_value_vs_greedy": 0.84,
+        "ci_95_full_dev_pp": 0.65,
+        "finish_reason_mix": {"submit": 39, "keep_baseline": 92, "no_tool_call": 68, "budget": 57},
+        "note": "Adds keep_baseline_sql() tool + expanded routing (vote-share threshold 0.625→0.75, T=0.7 cross-temp disagreement, hint-column-not-in-SQL). keep_baseline cuts per-question break rate 70%→37% as designed, but the agent overuses it (36% of calls) and total fixes collapse 38→13. T=0.7 rule is the largest regression (n=76, baseline-correct=25, fixes=3, breaks=10, net=-7) — cross-temperature disagreement is low-precision on a strong coder. Degenerate-result is still the only productive rule (+11 net). v2 is NOT statistically distinguishable from greedy (p=0.84); v1 stays as the headline. Tag: agentic-routed-q3cm-dev-v2. Writeup: agentic_v2_findings.md."
+      }
     }
   },
 

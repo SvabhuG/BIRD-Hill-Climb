@@ -107,20 +107,22 @@ def _normalize(s: str) -> str:
 
 
 def _extract_hint_columns(hint: str) -> list[str]:
-    """Pull likely column names out of the hint string."""
+    """Pull HIGH-PRECISION column names out of the hint string.
+
+    Initial v2 attempt also included CamelCase / snake_case tokens, but on
+    BIRD-dev that fired on 377/1534 questions (50.7% baseline-correct on the
+    routed slice — barely better than the full-dev baseline). Restricting to
+    backticked names only gives ~53 candidate hints, almost all of which name
+    a real column. The reduced recall is the right tradeoff: rule 5 is meant
+    to be high-precision, not exhaustive.
+    """
     if not hint:
         return []
-    cands: list[str] = []
-    cands.extend(_BACKTICK_RE.findall(hint))
-    cands.extend(_CAMEL_RE.findall(hint))
-    cands.extend(_SNAKE_RE.findall(hint))
     out: list[str] = []
     seen: set[str] = set()
-    for c in cands:
+    for c in _BACKTICK_RE.findall(hint):
         n = _normalize(c)
         if len(n) < 4:
-            continue
-        if c.lower() in _STOPWORDS:
             continue
         if n in seen:
             continue
