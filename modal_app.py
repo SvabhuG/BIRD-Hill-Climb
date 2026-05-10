@@ -408,6 +408,127 @@ def _prepare_local(split: str, limit: int, n_samples: int):
 @app.function(
     image=cpu_image,
     volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 15,
+)
+def _prepare_with_fewshot(split: str, limit: int, n_samples: int, k_shots: int):
+    """Build (messages, meta) pairs with retrieved few-shot examples from BIRD train.
+
+    Loads BIRD train once, builds a TrainIndex, then for each dev example
+    retrieves k same-db (with cross-db fallback) shots ranked by Jaccard
+    overlap on the question and renders them via `build_messages_with_fewshot`.
+
+    Returns the same (convos, metas) shape as `_prepare_local`.
+
+    Requires `/data/bird/train/train.json` to be present on the bird-data
+    volume. Run `modal run modal_app.py::download_bird --splits train` first.
+    """
+    from bird.data import load_split
+    from bird.fewshot import load_train_index, retrieve
+    from bird.prompts import build_messages_with_fewshot
+    from bird.schema import extract_schema
+
+    sp = load_split(Path(BIRD_ROOT) / split, name=split)
+    examples = sp.examples[:limit] if limit else sp.examples
+
+    train_root = Path(BIRD_ROOT) / "train"
+    if not (train_root / "train.json").exists():
+        raise FileNotFoundError(
+            f"BIRD train not found at {train_root}/train.json. "
+            "Run `modal run modal_app.py::download_bird --splits train` first."
+        )
+    print(f"[fewshot-prep] loading train index from {train_root}")
+    train = load_train_index(train_root)
+    print(f"[fewshot-prep] {len(train.examples)} train examples across "
+          f"{len(train.by_db_id)} db_ids")
+
+    schema_cache: dict[str, object] = {}
+    convos: list[list[dict]] = []
+    metas: list[dict] = []
+    for ex in examples:
+        if ex.db_id not in schema_cache:
+            schema_cache[ex.db_id] = extract_schema(
+                sp.db_path(ex.db_id), ex.db_id, n_samples=n_samples,
+            )
+        shots = retrieve(ex.question, ex.db_id, train, k=k_shots)
+        msgs = build_messages_with_fewshot(
+            ex, schema_cache[ex.db_id], shots, n_samples=n_samples,
+        )
+        convos.append(msgs)
+        metas.append({
+            "question_id": ex.question_id,
+            "db_id": ex.db_id,
+            "difficulty": ex.difficulty,
+            "gold_sql": ex.sql,
+            "fewshot_qids": [s.question_id for s in shots],
+            "fewshot_db_ids": [s.db_id for s in shots],
+        })
+    return convos, metas
+
+
+@app.local_entrypoint()
+def run_with_fewshot(
+    split: str = "dev",
+    limit: int = 0,
+    model: str = "Qwen/Qwen2.5-Coder-7B-Instruct",
+    k_shots: int = 4,
+    n_samples: int = 3,
+    max_tokens: int = 1024,
+    temperature: float = 0.0,
+    save_as: str = "",
+    base_model: bool = False,
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """Greedy run with k retrieved few-shot demos from BIRD train.
+
+    Prerequisite: BIRD train must already be on the bird-data Modal volume at
+    `/data/bird/train/train.json` and `/data/bird/train/train_databases/`.
+    If not, run `modal run modal_app.py::download_bird --splits train` first.
+    """
+    print(f"[orchestrator] preparing few-shot prompts for split={split}, "
+          f"limit={limit or 'all'}, k_shots={k_shots}")
+    convos, examples_meta = _prepare_with_fewshot.remote(split, limit, n_samples, k_shots)
+
+    print(f"[orchestrator] {len(convos)} prompts prepared; running inference on {model} "
+          f"(base_model={base_model}, tp={tensor_parallel_size})")
+    inf = Inference(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    save_tag = save_as or f"fewshot-k{k_shots}-{Path(model).name}-{split}-{int(time.time())}.json"
+    if base_model:
+        raw_prompts = [messages_to_raw_text(c) for c in convos]
+        raw = inf.complete.remote(raw_prompts, n=1, temperature=temperature, max_tokens=max_tokens)
+    else:
+        raw = inf.chat.remote(convos, n=1, temperature=temperature, max_tokens=max_tokens)
+
+    predictions = []
+    for meta, gens in zip(examples_meta, raw):
+        text = gens[0] if gens else ""
+        sql = extract_sql(text)
+        predictions.append({
+            "question_id": meta["question_id"],
+            "db_id": meta["db_id"],
+            "difficulty": meta["difficulty"],
+            "gold_sql": meta["gold_sql"],
+            "predicted_sql": sql,
+            "raw_completion": text,
+            "fewshot_qids": meta.get("fewshot_qids", []),
+            "fewshot_db_ids": meta.get("fewshot_db_ids", []),
+        })
+
+    print(f"[orchestrator] running execution evaluator")
+    summary = evaluate_predictions.remote(
+        split=split, predictions=predictions, save_as=save_tag,
+    )
+    print(json.dumps(summary, indent=2))
+    print(f"[done] saved as {save_tag} on bird-results volume")
+
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
     timeout=60 * 10,
 )
 def _prepare_for_linking(split: str, limit: int, n_samples: int):
