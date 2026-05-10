@@ -473,10 +473,9 @@ def run_agentic_routed(
     print(f"[routed] merging with baseline predictions from {baseline_filename}")
     routed_set = set(int(q) for q in qids)
     agent_by_qid = {int(p["question_id"]): p for p in agent_preds}
-    baseline_payload = json.loads((Path(RESULTS_ROOT) / baseline_filename).read_text()) if Path(RESULTS_ROOT).exists() else None
-    # The local entrypoint runs locally, so RESULTS_ROOT won't exist; pull baseline via Modal:
-    if baseline_payload is None:
-        baseline_payload = _fetch_baseline_via_volume.remote(baseline_filename)
+    # The local entrypoint runs locally and can't read the bird-results volume
+    # directly; pull baseline via a tiny Modal helper.
+    baseline_payload = _fetch_baseline_via_volume.remote(baseline_filename)
 
     merged_preds: list[dict] = []
     for r in baseline_payload["results"]:
