@@ -77,16 +77,19 @@ Each strategy implemented in an isolated worktree by an autonomous subagent, com
 
 | | Qwen2.5-Coder-32B-Inst (57.37%) | Qwen3-Coder-30B-A3B-Inst (60.63%) | Qwen3-32B fair (51.69%) |
 |---|---:|---:|---:|
-| linking | _running_ | _running_ | _running_ |
-| voting (n=8) | _running_ | **61.08%** (+0.45) | _running_ |
-| correction | **58.15%** (+0.78) | _running_ | _running_ |
-| CoT | **54.95%** (-2.42) | **58.74%** (-1.89) | _running_ |
-| fewshot | (pending train dl) | (pending train dl) | (pending train dl) |
+| linking (recall=97.8%) | **56.45%** (-0.92) ⬇ | _running_ | _running_ |
+| voting (n=8) | **58.15%** (+0.78) | **61.08%** (+0.45) | _running_ |
+| correction | **58.15%** (+0.78) | **61.54%** (+0.91) | _running_ |
+| CoT | **54.95%** (-2.42) ⬇ | **58.74%** (-1.89) ⬇ | _running_ |
+| fewshot | (train layout fix-up running) | (waiting) | (waiting) |
 
 **Insights from the cells we have so far:**
 
 - **Correction is a sanity-check strategy, not a hill-climbing lever.** On 32B-Coder-Instruct (38 exec_errors): retry rescued 12, +0.78pp. Ceiling shrinks fast as base models get cleaner — Qwen3-Coder-MoE has only 25 exec_errors → max +1.6pp possible.
-- **CoT regresses on coder-tuned models.** Qwen2.5-Coder-32B-Instruct: -2.42pp; Qwen3-Coder-30B-A3B-Instruct: -1.89pp. Forcing a natural-language plan stage hurts models that are post-trained to go directly to SQL — the plan is brittle (coder models don't reason in NL as cleanly as in code), and the SQL stage second-guesses itself. exec_error went *up* from 38 → 49 on Qwen2.5-Coder, confirming added confusion. **Implication: CoT is the wrong tool for coder-instruct bases. It would likely help Qwen3-32B-thinking (general-tuned) but we already get that "for free" via thinking mode.**
+- **Voting trims exec_errors but doesn't unlock semantic fixes.** +0.78pp on Qwen2.5-Coder-32B (exec_err 38 → 7), +0.45pp on Qwen3-Coder-MoE (exec_err 25 → 13). Same mechanism as correction: result-set vote naturally filters broken candidates. Above the exec_error floor, n=8 sampling adds noise that mostly cancels out on confident greedy bases.
+- **CoT regresses on coder-tuned models.** Qwen2.5-Coder-32B: -2.42pp; Qwen3-Coder-MoE: -1.89pp. Forcing a natural-language plan stage hurts models post-trained to go directly to SQL — the plan is brittle (coder models don't reason in NL as cleanly as in code), and the SQL stage second-guesses itself. exec_error went *up* from 38 → 49 on Qwen2.5-Coder, confirming added confusion. **Implication: CoT is the wrong tool for coder-instruct bases.**
+- **Schema linking also regressed on Qwen2.5-Coder-32B (-0.92pp), despite 97.8% linker recall.** The linker did its job — 1410/1534 questions had every gold column kept. But the SQL generator did *worse* with a filtered schema than with the full one. Hypothesis: the model exploits "extra" columns in the schema as disambiguating context (it knows what *not* to use as much as what to use), and removing them flattens that signal. Counter-intuitive but explains why all "compress the prompt" strategies hurt strong bases on BIRD's already-fitting prompts (max 5,371 tokens vs 15,360 budget).
+- **Bigger picture: the strategies dividing into two camps.** *Repair* strategies (correction, voting) trim the exec_error tail and give small but reliable lifts. *Replace* strategies (CoT, linking) modify the full prompt structure and *regress* on coder-tuned 30B-class bases. The model already knows how to reason about and select from full schemas; over-scaffolding gets in the way.
 
 ### Combined best
 _pending — once we know which strategies move the needle, layer the winners_

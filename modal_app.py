@@ -157,6 +157,59 @@ def download_bird(splits: str = "dev") -> dict:
     return summary
 
 
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data},
+    timeout=60 * 30,
+)
+def fix_train_layout() -> dict:
+    """One-shot repair: BIRD train.zip extracted as `train/train/...` with an
+    inner train_databases.zip and a __MACOSX dir. Flatten + extract.
+
+    Idempotent: if `train/train.json` already exists at the top, no-op.
+    """
+    import shutil
+    import zipfile
+
+    root = Path(BIRD_ROOT) / "train"
+    if (root / "train.json").exists():
+        return {"status": "already_flat", "path": str(root)}
+
+    inner = root / "train"
+    if not (inner / "train.json").exists():
+        return {"status": "no_inner_train_dir", "path": str(root), "items": [p.name for p in root.iterdir()]}
+
+    # Move every file/dir from inner up to root.
+    for child in inner.iterdir():
+        target = root / child.name
+        if target.exists():
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+        shutil.move(str(child), str(target))
+    inner.rmdir()
+
+    # Drop macOS metadata.
+    macosx = root / "__MACOSX"
+    if macosx.exists():
+        shutil.rmtree(macosx)
+
+    # Unzip train_databases.zip if still zipped.
+    inner_zip = root / "train_databases.zip"
+    if inner_zip.exists():
+        print(f"[fix_train_layout] extracting {inner_zip}")
+        with zipfile.ZipFile(inner_zip) as zf:
+            zf.extractall(root)
+        inner_zip.unlink()
+
+    bird_data.commit()
+    n_dbs = len(list((root / "train_databases").iterdir())) if (root / "train_databases").exists() else 0
+    with (root / "train.json").open() as f:
+        n_examples = len(json.load(f))
+    return {"status": "fixed", "path": str(root), "n_examples": n_examples, "n_databases": n_dbs}
+
+
 # ============================================================
 # Inference (GPU)
 # ============================================================
