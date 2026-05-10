@@ -74,7 +74,19 @@ Each strategy implemented in an isolated worktree by an autonomous subagent, com
 - Qwen3.6-27B: _pending_
 
 ### Strategy × Model matrix (5×3 = 15 cells)
-_pending the in-flight runs_
+
+| | Qwen2.5-Coder-32B-Inst (57.37%) | Qwen3-Coder-30B-A3B-Inst (60.63%) | Qwen3-32B fair (pending) |
+|---|---:|---:|---:|
+| linking | _running_ | _running_ | _running_ |
+| voting (n=8) | _running_ | _running_ | _running_ |
+| correction | **58.15%** (+0.78) | _running_ | _running_ |
+| CoT | _running_ | _running_ | _running_ |
+| fewshot | (pending train dl) | (pending train dl) | (pending train dl) |
+
+**Correction × Qwen2.5-Coder-32B-Instruct insight (+0.78pp):**
+- 38 exec_errors went in. Retry produced: **12 → correct**, 7 → still exec_error, 19 → "wrong" (runnable but semantically wrong).
+- 32% rescue rate on the addressable bucket — matches the agent's pre-run prediction.
+- Strategy's ceiling shrinks fast as base models get cleaner (7B had 150 exec_errors; 30B-Coder-MoE has just 25). On the strongest base, correction can move at most ~+0.5pp. **It's a "sanity-check the cheap retry" strategy, not a hill-climbing lever.**
 
 ### Combined best
 _pending — once we know which strategies move the needle, layer the winners_
