@@ -122,6 +122,23 @@ Why the failure to compound:
 
 **Lesson: composing strategies with overlapping mechanisms doesn't add up.** For meaningful gains, compose strategies that address *orthogonal* failure modes — e.g., correction (exec_error) + a verifier-style filter (semantic-wrong detection) + a column-disambiguation pass.
 
+### Per-question diff: which questions did each strategy win or lose?
+
+| | combined → wrong | combined → correct | net |
+|---|---:|---:|---:|
+| simple (corr 590 ✓) | 7 broken | 8 fixed | **+1** |
+| moderate (corr 280 ✓) | 6 broken | 0 fixed | **−6** |
+| challenging (corr 74 ✓) | 2 broken | 1 fixed | **−1** |
+| **total** | **15** | **9** | **−6** |
+
+Every transition was a *different SQL* — no eval flakes, both pipelines are deterministic. The mechanism for each direction:
+
+- **Voting BREAKS moderates because diversity introduces wrong-column variance.** Sample broken cases: greedy-correction filtered by `District = 'Fresno County Office of Education'`; combined filtered by `StatusType = 'Active'` (wrong-but-confident vote). Greedy used `d.A2 = 'Hl.m. Praha'` (correct Czech name); combined used `d.A2 = 'Prague'` (English; wrong-but-popular vote winner). Greedy returned `c.client_id`; combined returned `c.gender` — completely wrong column. **In all six moderate losses, the correct SQL existed in the candidate pool — voting just picked a different one.**
+
+- **Voting FIXES some simples by averaging out greedy's brittle quirks.** Cases where correction's first pass had a clearly broken JOIN (`a.client_id = d.client_id` on a chain that doesn't connect that way) or returned more columns than gold expected (3 cols when gold wants 1, or `CASE WHEN ... THEN 'Yes' ELSE 'No'` when gold wants raw `label`). On simples, the diversity pool surfaces a cleaner answer.
+
+**The asymmetry is the lesson:** voting helps when the greedy answer has a stylistic quirk (over-projection, redundant CASE, wrong literal language); voting hurts when the moderate question has a *single* sharp interpretation that greedy gets but diversity disrupts. Combined isn't strictly worse — it's a different bias-variance tradeoff. **For Qwen3-Coder-MoE on BIRD, lower variance (correction alone) is the better operating point.**
+
 ## Audit: are the regressions real, or pipeline bugs?
 
 Ran a cell-by-cell audit on all 12 finalized strategy×model results. **All cells structurally clean** (1534 predictions each, status counts re-sum, no empty SQL on non-empty status, no truncation on non-thinking cells). One bug was caught and fixed mid-matrix (linking's `_column_def` wasn't backtick-quoting BIRD's spaces-in-names columns; cost ~1.4pp on Qwen3-Coder-MoE alone). After the fix, the *residual* regressions on `linking`, `CoT`, and `fewshot` are genuine model failures, not pipeline issues:
