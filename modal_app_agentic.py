@@ -94,10 +94,13 @@ class Agent:
         limit: int,
         save_as: str,
         question_ids: list[int] | None = None,
+        baseline_sql_by_qid: dict[str, str] | None = None,
     ) -> dict:
         """Run the agent on `limit` BIRD examples and return predictions + traces.
 
         If `question_ids` is provided, run on exactly that set (ignores `limit`).
+        `baseline_sql_by_qid` maps str(qid) -> baseline greedy SQL; passed through
+        to the agent so it can anchor on / fall back to the baseline.
         """
         from bird.agentic import build_initial_messages, step_agent
         from bird.data import load_split
@@ -118,6 +121,15 @@ class Agent:
         temperature = self.temperature_x100 / 100.0
         tool_timeout_s = self.tool_timeout_cs / 100.0
         cfg = GenConfig(n=1, temperature=temperature, top_p=1.0, max_tokens=self.max_tokens)
+        baseline_lookup: dict[int, str] = {}
+        if baseline_sql_by_qid:
+            for k, v in baseline_sql_by_qid.items():
+                try:
+                    baseline_lookup[int(k)] = v or ""
+                except (TypeError, ValueError):
+                    continue
+        if baseline_lookup:
+            print(f"[agent] baseline SQL available for {len(baseline_lookup)} qids")
 
         def chat_fn(messages):
             outs = self.engine.chat([messages], cfg)
@@ -132,9 +144,12 @@ class Agent:
                 schema_cache[ex.db_id] = extract_schema(sp.db_path(ex.db_id), ex.db_id, n_samples=self.n_samples)
             schema = schema_cache[ex.db_id]
             db_path = sp.db_path(ex.db_id)
+            baseline_sql = baseline_lookup.get(ex.question_id, "")
 
             t0 = time.time()
-            msgs = build_initial_messages(ex, schema, n_samples=self.n_samples)
+            msgs = build_initial_messages(
+                ex, schema, n_samples=self.n_samples, baseline_sql=baseline_sql,
+            )
             try:
                 trace = step_agent(
                     msgs,
@@ -142,6 +157,7 @@ class Agent:
                     max_turns=self.max_turns,
                     tool_timeout_s=tool_timeout_s,
                     chat_fn=chat_fn,
+                    baseline_sql=baseline_sql,
                 )
             except Exception as e:
                 print(f"[agent] q{ex.question_id}: trace crashed: {e!r}")
@@ -439,6 +455,15 @@ def run_agentic_routed(
     tag = save_as or f"agentic-routed-{Path(model).name}-{split}-{len(qids)}-{int(time.time())}.json"
     print(f"[routed] running agent on {len(qids)} questions; tag={tag}")
 
+    # Fetch baseline up front so we can (1) supply baseline_sql to the agent for
+    # the keep_baseline_sql affordance, and (2) merge with non-routed predictions later.
+    print(f"[routed] fetching baseline from {baseline_filename}")
+    baseline_payload = _fetch_baseline_via_volume.remote(baseline_filename)
+    baseline_sql_by_qid: dict[str, str] = {
+        str(int(r["question_id"])): (r.get("predicted_sql") or "")
+        for r in baseline_payload["results"]
+    }
+
     agent = Agent(
         model_name=model,
         tensor_parallel_size=tensor_parallel_size,
@@ -451,6 +476,7 @@ def run_agentic_routed(
     )
     result = agent.solve_batch.remote(
         split=split, limit=0, save_as=tag, question_ids=qids,
+        baseline_sql_by_qid=baseline_sql_by_qid,
     )
     agent_preds = result["predictions"]
     agent_stats = result["stats"]
@@ -473,9 +499,6 @@ def run_agentic_routed(
     print(f"[routed] merging with baseline predictions from {baseline_filename}")
     routed_set = set(int(q) for q in qids)
     agent_by_qid = {int(p["question_id"]): p for p in agent_preds}
-    # The local entrypoint runs locally and can't read the bird-results volume
-    # directly; pull baseline via a tiny Modal helper.
-    baseline_payload = _fetch_baseline_via_volume.remote(baseline_filename)
 
     merged_preds: list[dict] = []
     for r in baseline_payload["results"]:
@@ -537,6 +560,251 @@ def _fetch_baseline_via_volume(filename: str) -> dict:
     without needing a local copy of the baseline file.
     """
     return json.loads((Path(RESULTS_ROOT) / filename).read_text())
+
+
+@app.cls(
+    image=gpu_image,
+    gpu="B200",
+    volumes={HF_HOME: hf_cache, BIRD_ROOT: bird_data, RESULTS_ROOT: results_vol},
+    timeout=2 * 60 * 60,
+    scaledown_window=300,
+)
+class Sampler:
+    """Single-pass non-greedy sampler used to generate the T=0.7 sidecar
+    predictions for cross-temperature disagreement routing (Rule 4).
+    """
+
+    model_name: str = modal.parameter(default="Qwen/Qwen3-Coder-30B-A3B-Instruct")
+    tensor_parallel_size: int = modal.parameter(default=1)
+    max_model_len: int = modal.parameter(default=16384)
+
+    @modal.enter()
+    def _load(self):
+        from bird.inference import VLLMEngine
+
+        t0 = time.time()
+        self.engine = VLLMEngine(
+            model=self.model_name,
+            tensor_parallel_size=self.tensor_parallel_size,
+            max_model_len=self.max_model_len,
+            download_dir=HF_HOME,
+        )
+        print(f"[sampler] loaded {self.model_name} in {time.time() - t0:.1f}s")
+
+    @modal.method()
+    def sample_full(
+        self,
+        split: str,
+        n_samples: int,
+        max_tokens: int,
+        temperature: float,
+        top_p: float,
+        save_as: str,
+    ) -> dict:
+        """Generate ONE non-greedy sample per question on the full split.
+
+        Returns predictions in the same shape as `evaluate_predictions` expects.
+        """
+        from bird.data import load_split
+        from bird.inference import GenConfig
+        from bird.prompts import build_messages, extract_sql
+        from bird.schema import extract_schema
+
+        sp = load_split(Path(BIRD_ROOT) / split, name=split)
+        examples = sp.examples
+        print(f"[sampler] preparing prompts for {len(examples)} questions")
+
+        schema_cache: dict = {}
+        convos: list[list[dict]] = []
+        metas: list[dict] = []
+        for ex in examples:
+            if ex.db_id not in schema_cache:
+                schema_cache[ex.db_id] = extract_schema(
+                    sp.db_path(ex.db_id), ex.db_id, n_samples=n_samples,
+                )
+            convos.append(build_messages(ex, schema_cache[ex.db_id], n_samples=n_samples))
+            metas.append({
+                "question_id": ex.question_id,
+                "db_id": ex.db_id,
+                "difficulty": ex.difficulty,
+                "gold_sql": ex.sql,
+            })
+
+        cfg = GenConfig(
+            n=1, temperature=temperature, top_p=top_p, max_tokens=max_tokens,
+        )
+        print(f"[sampler] generating at T={temperature} top_p={top_p} n=1")
+        t0 = time.time()
+        outs = self.engine.chat(convos, cfg)
+        print(f"[sampler] generated {len(outs)} samples in {time.time() - t0:.1f}s")
+
+        predictions: list[dict] = []
+        for meta, out in zip(metas, outs):
+            text = out.texts[0] if out.texts else ""
+            sql = extract_sql(text)
+            predictions.append({
+                "question_id": meta["question_id"],
+                "db_id": meta["db_id"],
+                "difficulty": meta["difficulty"],
+                "gold_sql": meta["gold_sql"],
+                "predicted_sql": sql,
+                "raw_completion": text,
+            })
+
+        if save_as:
+            out_path = Path(RESULTS_ROOT) / save_as
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps({"split": split, "n": len(predictions),
+                                            "temperature": temperature, "top_p": top_p,
+                                            "results": predictions}, indent=2))
+            results_vol.commit()
+            print(f"[sampler] wrote {out_path}")
+
+        return {"split": split, "n": len(predictions), "saved": save_as}
+
+
+@app.local_entrypoint()
+def run_t07_baseline(
+    split: str = "dev",
+    model: str = "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+    n_samples: int = 3,
+    max_tokens: int = 1024,
+    temperature: float = 0.7,
+    top_p: float = 0.95,
+    save_as: str = "baseline-qwen3-coder-30b-a3b-instruct-dev-t07.json",
+    tensor_parallel_size: int = 1,
+    max_model_len: int = 16384,
+):
+    """One non-greedy sample per question on the full split. Used as the T=0.7
+    sidecar for cross-temperature-disagreement routing (Rule 4).
+    """
+    print(f"[t07] sampling {model} on split={split} at T={temperature} top_p={top_p}")
+    sampler = Sampler(
+        model_name=model,
+        tensor_parallel_size=tensor_parallel_size,
+        max_model_len=max_model_len,
+    )
+    summary = sampler.sample_full.remote(
+        split=split,
+        n_samples=n_samples,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=top_p,
+        save_as=save_as,
+    )
+    print(json.dumps(summary, indent=2))
+
+
+@app.function(
+    image=cpu_image,
+    volumes={BIRD_ROOT: bird_data, RESULTS_ROOT: results_vol},
+    cpu=8,
+    timeout=60 * 30,
+)
+def compute_t07_disagreement(
+    split: str,
+    baseline_filename: str,
+    t07_filename: str,
+    save_as: str,
+    timeout_s: float = 10.0,
+) -> dict:
+    """Execute greedy SQL and T=0.7 SQL side-by-side; flag questions where the
+    result-sets differ. Output is `{qid: bool}`. Skips when either SQL errors
+    or the rows match by canonical hash.
+    """
+    import hashlib
+    import sqlite3
+    import threading
+
+    split_root = Path(BIRD_ROOT) / split
+    db_dir = split_root / f"{split}_databases"
+
+    baseline = json.loads((Path(RESULTS_ROOT) / baseline_filename).read_text())
+    t07 = json.loads((Path(RESULTS_ROOT) / t07_filename).read_text())
+
+    base_by_qid = {int(r["question_id"]): r for r in baseline["results"]}
+    t07_by_qid = {int(r["question_id"]): r for r in t07["results"]}
+
+    def _exec_ro(db_path, sql, t_s):
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=t_s)
+        conn.text_factory = lambda b: b.decode("utf-8", errors="replace") if isinstance(b, bytes) else b
+        timer = threading.Timer(t_s, conn.interrupt)
+        timer.daemon = True
+        timer.start()
+        try:
+            cur = conn.cursor()
+            cur.execute(sql)
+            return cur.fetchall()
+        finally:
+            timer.cancel()
+            conn.close()
+
+    def _canonical(rows):
+        try:
+            normed = sorted([tuple(repr(c) for c in r) for r in rows])
+        except Exception:
+            normed = sorted(repr(r) for r in rows)
+        return hashlib.sha1(repr(normed).encode("utf-8")).hexdigest()
+
+    flags: dict[int, bool] = {}
+    n_checked = n_disagree = n_skipped = 0
+    for qid, base in base_by_qid.items():
+        if qid not in t07_by_qid:
+            n_skipped += 1
+            continue
+        base_sql = (base.get("predicted_sql") or "").strip()
+        t07_sql = (t07_by_qid[qid].get("predicted_sql") or "").strip()
+        if not base_sql or not t07_sql:
+            n_skipped += 1
+            continue
+        db_path = db_dir / base["db_id"] / f'{base["db_id"]}.sqlite'
+        try:
+            base_rows = _exec_ro(db_path, base_sql, timeout_s)
+        except Exception:
+            # Baseline errors are already routed via rule 1; this signal is moot.
+            flags[qid] = False
+            n_skipped += 1
+            continue
+        try:
+            t07_rows = _exec_ro(db_path, t07_sql, timeout_s)
+        except Exception:
+            # T=0.7 errored — strong disagreement signal (modal sampling unstable).
+            flags[qid] = True
+            n_checked += 1
+            n_disagree += 1
+            continue
+        same = _canonical(base_rows) == _canonical(t07_rows)
+        flags[qid] = not same
+        n_checked += 1
+        if not same:
+            n_disagree += 1
+        if n_checked % 200 == 0:
+            print(f"[t07-diff] {n_checked} checked, {n_disagree} disagree so far")
+
+    payload = {str(k): v for k, v in flags.items()}
+    out = Path(RESULTS_ROOT) / save_as
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(payload, indent=2))
+    results_vol.commit()
+    print(f"[t07-diff] DONE: {n_checked} executed, {n_disagree} disagree, {n_skipped} skipped")
+    print(f"[t07-diff] wrote {out}")
+    return {"n_checked": n_checked, "n_disagree": n_disagree, "n_skipped": n_skipped, "saved": save_as}
+
+
+@app.local_entrypoint()
+def run_t07_disagreement(
+    split: str = "dev",
+    baseline_filename: str = "baseline-qwen3-coder-30b-a3b-instruct-dev-full.json",
+    t07_filename: str = "baseline-qwen3-coder-30b-a3b-instruct-dev-t07.json",
+    save_as: str = "t07-disagreement-qwen3-coder-30b-a3b-instruct-dev.json",
+):
+    summary = compute_t07_disagreement.remote(
+        split=split,
+        baseline_filename=baseline_filename,
+        t07_filename=t07_filename,
+        save_as=save_as,
+    )
+    print(json.dumps(summary, indent=2))
 
 
 @app.local_entrypoint()

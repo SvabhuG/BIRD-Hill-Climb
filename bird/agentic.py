@@ -81,7 +81,12 @@ from .schema import DatabaseSchema, render_ddl_with_samples
 AGENT_SYSTEM = """\
 You are a senior data analyst writing correct, idiomatic SQLite SQL.
 
-You have two tools you can call by emitting a JSON block:
+You are given a BASELINE candidate SQL drafted by a strong zero-shot model.
+Your job is to probe with execute_sql and decide whether to keep it, fix it,
+or replace it. The baseline is usually defensible; only override it when you
+can point at a SPECIFIC defect.
+
+You have three tools you can call by emitting a JSON block:
 
 ```json
 {"tool": "execute_sql", "args": {"sql": "SELECT ..."}}
@@ -96,13 +101,25 @@ You have two tools you can call by emitting a JSON block:
   Submits your final answer and ends the session. Call this exactly once,
   at the end, with the SELECT statement that answers the question.
 
+```json
+{"tool": "keep_baseline_sql", "args": {}}
+```
+  Keeps the baseline candidate SQL unchanged as the final answer and ends the
+  session. Use this when probing did NOT reveal a concrete defect in the baseline.
+
 Rules:
 - Emit at most ONE JSON tool block per message. After it, stop.
 - Use execute_sql freely (up to 5 times) to test drafts. Tool output is fed
   back to you; reason briefly on what changed, then either refine and try
-  again, or call submit.
-- Only the SQL inside submit's `args.sql` is graded. Make it a single
-  SELECT (or WITH ... SELECT) ending without trailing prose."""
+  again, or call submit / keep_baseline_sql.
+- If after probing you CANNOT identify a specific defect in the baseline SQL
+  — a wrong column, wrong join, missing filter, missing null handling, or
+  similar — you SHOULD call keep_baseline_sql() rather than submitting a
+  modified query. Changing the SQL without a specific defect to fix usually
+  makes things worse.
+- Only the SQL inside submit's `args.sql` (or the baseline, if you called
+  keep_baseline_sql) is graded. Make it a single SELECT (or WITH ... SELECT)
+  ending without trailing prose."""
 
 
 AGENT_USER = """\
@@ -117,7 +134,13 @@ AGENT_USER = """\
 ### Question
 {question}
 
-Begin. Test your draft with execute_sql if helpful, then call submit."""
+### Baseline candidate SQL (your starting point, may be wrong)
+```sql
+{baseline_sql}
+```
+
+Begin. Probe with execute_sql if helpful. Then either submit a fix or call
+keep_baseline_sql if you can't point to a specific defect."""
 
 
 # ----------------------- tool dispatch -----------------------
@@ -170,13 +193,13 @@ def run_tool(name: str, args: dict, db_path: str | Path, timeout_s: float = 10.0
         except Exception as e:  # pragma: no cover
             return f"ERROR: {e!r}"
         return _format_observation(cols, list(rows))
-    return f"ERROR: unknown tool `{name}`. Available: execute_sql, submit."
+    return f"ERROR: unknown tool `{name}`. Available: execute_sql, submit, keep_baseline_sql."
 
 
 # ----------------------- tool-call parsing -----------------------
 
 _FENCE_JSON_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.IGNORECASE | re.DOTALL)
-_TOOL_RE = re.compile(r'"tool"\s*:\s*"(execute_sql|submit)"', re.IGNORECASE)
+_TOOL_RE = re.compile(r'"tool"\s*:\s*"(execute_sql|submit|keep_baseline_sql)"', re.IGNORECASE)
 _SQL_ARG_RE = re.compile(r'"sql"\s*:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL)
 
 
@@ -242,13 +265,20 @@ class AgentTrace:
     history: list[dict] = field(default_factory=list)  # final messages (sans system)
 
 
-def build_initial_messages(example: BirdExample, schema: DatabaseSchema, n_samples: int = 3) -> list[dict]:
+def build_initial_messages(
+    example: BirdExample,
+    schema: DatabaseSchema,
+    n_samples: int = 3,
+    baseline_sql: str = "",
+) -> list[dict]:
     schema_block = render_ddl_with_samples(schema, n_samples=n_samples).strip()
     evidence = (example.evidence or "").strip() or "(none provided)"
+    baseline_sql_clean = (baseline_sql or "").strip() or "-- (no baseline available)"
     user = AGENT_USER.format(
         schema_block=schema_block,
         evidence=evidence,
         question=example.question.strip(),
+        baseline_sql=baseline_sql_clean,
     )
     return [
         {"role": "system", "content": AGENT_SYSTEM},
@@ -263,11 +293,15 @@ def step_agent(
     max_turns: int = 6,
     tool_timeout_s: float = 10.0,
     chat_fn=None,
+    baseline_sql: str = "",
 ) -> AgentTrace:
     """Run the agent loop until termination or budget exhaustion.
 
     `chat_fn(list[messages]) -> str` is injected so this is testable without
     Modal/vLLM (smoke tests can pass a mock function).
+
+    `baseline_sql` is the candidate SQL the baseline produced for this question.
+    If the agent calls `keep_baseline_sql`, this string becomes the final SQL.
     """
     assert chat_fn is not None, "chat_fn is required"
     if "question_id" in messages[0]:  # defensive: don't expect this layout
@@ -298,6 +332,11 @@ def step_agent(
             finish_reason = "submit"
             break
 
+        if call["tool"] == "keep_baseline_sql":
+            final_sql = (baseline_sql or "").strip()
+            finish_reason = "keep_baseline"
+            break
+
         if call["tool"] == "execute_sql":
             n_tool_calls += 1
             sql_arg = (call["args"] or {}).get("sql", "")
@@ -313,8 +352,8 @@ def step_agent(
         messages = messages + [{"role": "user", "content": run_tool(call["tool"], call.get("args") or {}, db_path)}]
 
     if finish_reason == "budget" and not final_sql:
-        # Best-effort: use last executed SQL if any, else empty.
-        final_sql = last_executed_sql
+        # Best-effort: prefer baseline (anchored answer) over last-tried draft.
+        final_sql = (baseline_sql or "").strip() or last_executed_sql
 
     # Strip trailing prose / fences / semicolons consistently with extract_sql.
     if final_sql:

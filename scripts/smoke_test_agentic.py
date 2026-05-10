@@ -83,6 +83,10 @@ def main() -> None:
         assert obs.startswith("ERROR: unknown tool"), obs
         print(f"  [PASS] {obs[:60]!r}")
 
+        print("\n== parse_tool_call: keep_baseline_sql ==")
+        out = parse_tool_call('```json\n{"tool":"keep_baseline_sql","args":{}}\n```')
+        _check("tool", out["tool"], "keep_baseline_sql")
+
         # Build a synthetic example
         schema = extract_schema(db_path, "music", n_samples=2)
         ex = BirdExample(
@@ -124,6 +128,24 @@ def main() -> None:
         _check("finish_reason", trace.finish_reason, "no_tool_call")
         assert "select name from artist" in trace.final_sql.lower(), trace.final_sql
         print(f"  [PASS] extracted: {trace.final_sql!r}")
+
+        print("\n== step_agent: keep_baseline_sql returns baseline ==")
+        baseline = "SELECT name FROM artist WHERE country='UK';"
+        msgs4 = build_initial_messages(ex, schema, baseline_sql=baseline)
+        text = 'No defect found.\n```json\n{"tool":"keep_baseline_sql","args":{}}\n```'
+        trace = step_agent(
+            msgs4, db_path=db_path, max_turns=3,
+            chat_fn=lambda _m: text, baseline_sql=baseline,
+        )
+        _check("finish_reason", trace.finish_reason, "keep_baseline")
+        assert trace.final_sql == baseline, trace.final_sql
+        print(f"  [PASS] kept baseline: {trace.final_sql!r}")
+
+        print("\n== build_initial_messages: baseline included in user prompt ==")
+        msgs5 = build_initial_messages(ex, schema, baseline_sql=baseline)
+        assert baseline in msgs5[1]["content"], msgs5[1]["content"]
+        assert "Baseline candidate SQL" in msgs5[1]["content"]
+        print("  [PASS] baseline embedded in user prompt")
 
     print("\nALL AGENTIC SMOKE TESTS PASSED.")
 
