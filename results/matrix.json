@@ -80,6 +80,15 @@
     }
   },
 
+  "stacked_voting_correction": {
+    "branch": "feat/stacked-voting-correction (commit c8d2cd7)",
+    "description": "Composed strategy: greedy correction first; only escalate to voting+correction if greedy errored OR returned degenerate result. Inside voting: greedy is candidate-0 (R2: strict-override only), rescued candidates can't outvote originally-valid ones (R3).",
+    "results": {
+      "Qwen3-Coder-30B-A3B-Instruct": {"ex": 0.6121, "delta": 0.0058, "escalation_rate": 0.066, "kept_greedy": 93, "vote_overrode": 8, "note": "Worked as engineered; 6.6% escalation; vote rarely overrides greedy. Below correction-alone (+0.91pp). Voting itself has near-zero marginal value on this confident base."},
+      "Qwen3.6-27B": {"note": "in flight"}
+    }
+  },
+
   "best_per_base": {
     "Qwen2.5-Coder-32B-Instruct":  {"strategy": "voting OR correction (tied)", "ex": 0.5815, "delta": 0.0078},
     "Qwen3-Coder-30B-A3B-Instruct":{"strategy": "correction",                  "ex": 0.6154, "delta": 0.0091, "is_overall_best": true},
