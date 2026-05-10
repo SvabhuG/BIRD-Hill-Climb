@@ -55,22 +55,55 @@ cpu_image = (
 )
 
 # GPU image used by the vLLM engine.
+#
+# Pin rationale (May 2026):
+#   * Qwen3.6-27B (model_type `qwen3_5`, arch `Qwen3_5ForConditionalGeneration`)
+#     ships against transformers 5.x. vllm 0.19.0 originally pinned
+#     `transformers<5,>=4.56.0` (vllm-project/vllm#39216) which excluded the new
+#     architecture. vllm 0.20.2 relaxes that to allow transformers 5.5.1+
+#     (`transformers!=5.0.*..!=5.5.0,>=4.56.0`).
+#   * vllm 0.20.2 still supports the older Qwen2.5-Coder / Qwen3-Coder models
+#     we use, so this is an additive bump (no regression for prior baselines).
+#   * transformers 5.8.0 is the current latest and is the version the Qwen3.6
+#     model card recommends ("latest transformers required").
+#   * Old combo (vllm==0.11.0 + transformers==4.57.0) failed engine init with
+#     "checkpoint has model type `qwen3_5` but Transformers does not recognize
+#     this architecture". Going forward — never pair vllm<0.20 with
+#     transformers>=5, that triggers the Qwen2Tokenizer.all_special_tokens_extended
+#     attribute error (memory note feedback_vllm_transformers_pinning.md).
+#   * vllm 0.20.2 pulls in flashinfer 0.6.8 which (when used as the attention
+#     backend) JIT-compiles trtllm fmha kernels at engine-init time. That JIT
+#     needs both nvcc *and* the CCCL `nv/target` header, neither of which ships
+#     with the torch 2.11.0 wheel. We sidestep the JIT entirely by forcing the
+#     `FLASH_ATTN` attention backend (also auto-detected as available on B200,
+#     and doesn't need any JIT compile). This is the recommended workaround per
+#     flashinfer-ai/flashinfer#1919 / vllm-project/vllm#26642 when nvcc/CCCL
+#     can't be made available — and it's what we want anyway since FLASH_ATTN
+#     has stable kernels and avoids first-call latency.
 gpu_image = (
     modal.Image.debian_slim(python_version=_PY)
     .apt_install("git")
-    # Known-working combo for the Qwen2Tokenizer.all_special_tokens_extended
-    # incompatibility (verl-project/verl#4337, QwenLM/Qwen3-VL#2058,
-    # rllm-org/rllm#388). Older vllm + newer transformers, OR newer vllm + older
-    # transformers, both break — only this paired version works.
     .pip_install(
-        "vllm==0.11.0",
-        "transformers==4.57.0",
+        "vllm==0.20.2",
+        "transformers==5.8.0",
         "tqdm",
         "pydantic>=2",
         "sqlglot>=25",
         "huggingface_hub",
     )
-    .env({"HF_HOME": HF_HOME, "HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .env({
+        "HF_HOME": HF_HOME,
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        # Qwen3.6's gated-delta-net layers trigger vllm's FP8 fused MoE path
+        # which calls DeepGEMM for E8M0-scaled GEMMs. The DeepGEMM backend
+        # isn't bundled with the vllm wheel and JIT-builds it (and even when
+        # available has accuracy issues on Blackwell — vllm-project/vllm#37804,
+        # vllm-project/vllm#21562). The model itself is bf16, so we don't
+        # actually need FP8 kernels — disable the path entirely and let vllm
+        # fall back to the Triton FP8/bf16 kernels.
+        "VLLM_USE_DEEP_GEMM": "0",
+        "VLLM_USE_DEEP_GEMM_E8M0": "0",
+    })
     .pip_install("hf_transfer")
     .add_local_python_source("bird")
 )
@@ -172,6 +205,10 @@ class Inference:
     model_name: str = modal.parameter(default="Qwen/Qwen2.5-Coder-7B-Instruct")
     tensor_parallel_size: int = modal.parameter(default=1)
     max_model_len: int = modal.parameter(default=16384)
+    # FLASH_ATTN ships as a pre-built kernel and avoids flashinfer's JIT-compile
+    # step (which needs nvcc + CCCL headers we don't ship in the image). Empty
+    # string => let vLLM auto-pick.
+    attention_backend: str = modal.parameter(default="FLASH_ATTN")
 
     @modal.enter()
     def _load(self):
@@ -184,6 +221,7 @@ class Inference:
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             download_dir=HF_HOME,
+            attention_backend=self.attention_backend or None,
         )
         print(f"[inference] loaded {self.model_name} in {time.time() - t0:.1f}s")
 
