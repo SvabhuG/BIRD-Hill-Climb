@@ -176,29 +176,53 @@ def run_tool(name: str, args: dict, db_path: str | Path, timeout_s: float = 10.0
 # ----------------------- tool-call parsing -----------------------
 
 _FENCE_JSON_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.IGNORECASE | re.DOTALL)
+_TOOL_RE = re.compile(r'"tool"\s*:\s*"(execute_sql|submit)"', re.IGNORECASE)
+_SQL_ARG_RE = re.compile(r'"sql"\s*:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL)
+
+
+def _coerce_tool_call(blob: str) -> dict | None:
+    """Try strict JSON first; on failure, regex-extract tool+sql so we recover from
+    common malformations (unterminated strings, trailing fence, escaped backticks)."""
+    blob = blob.strip()
+    if not blob:
+        return None
+    try:
+        obj = json.loads(blob)
+        if isinstance(obj, dict) and "tool" in obj:
+            return {"tool": str(obj["tool"]), "args": obj.get("args") or {}}
+    except json.JSONDecodeError:
+        pass
+    # Regex fallback: tool name + sql string. Handles q0/q5-style broken JSON
+    # where the model dropped a `}` or trailing fence into the args.sql value.
+    m_tool = _TOOL_RE.search(blob)
+    m_sql = _SQL_ARG_RE.search(blob)
+    if m_tool:
+        sql = ""
+        if m_sql:
+            # Un-escape JSON string escapes manually since we couldn't parse.
+            sql = m_sql.group(1).encode("utf-8").decode("unicode_escape", errors="ignore")
+        return {"tool": m_tool.group(1), "args": {"sql": sql}}
+    return None
 
 
 def parse_tool_call(text: str) -> dict | None:
-    """Find the first JSON tool block in `text`. Returns {"tool", "args"} or None."""
+    """Find the first parseable tool call in `text`. Returns {"tool", "args"} or None.
+
+    Robustness: model output sometimes has malformed JSON (unterminated string,
+    extra `}`). We try strict json.loads, then a regex fallback that pulls out
+    `"tool"` + `"sql"` keys directly. This makes the parser forgiving without
+    requiring the model to be perfect.
+    """
     for blob in _FENCE_JSON_RE.findall(text):
-        blob = blob.strip()
-        if not blob:
-            continue
-        try:
-            obj = json.loads(blob)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(obj, dict) and "tool" in obj:
-            return {"tool": str(obj["tool"]), "args": obj.get("args") or {}}
-    # Fallback: a bare top-level JSON object (no fence)
-    text = text.strip()
-    if text.startswith("{") and text.endswith("}"):
-        try:
-            obj = json.loads(text)
-            if isinstance(obj, dict) and "tool" in obj:
-                return {"tool": str(obj["tool"]), "args": obj.get("args") or {}}
-        except json.JSONDecodeError:
-            pass
+        call = _coerce_tool_call(blob)
+        if call is not None:
+            return call
+    # Bare top-level JSON (no fence)
+    stripped = text.strip()
+    if stripped.startswith("{"):
+        call = _coerce_tool_call(stripped)
+        if call is not None:
+            return call
     return None
 
 

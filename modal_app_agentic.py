@@ -67,10 +67,12 @@ class Agent:
     tensor_parallel_size: int = modal.parameter(default=1)
     max_model_len: int = modal.parameter(default=16384)
     max_turns: int = modal.parameter(default=6)
-    tool_timeout_s: float = modal.parameter(default=10.0)
+    # NOTE: modal.parameter only allows int|str|bytes|bool — encode floats as
+    # *_x100 ints and divide on read.
+    tool_timeout_cs: int = modal.parameter(default=1000)   # centiseconds; 1000 = 10.0s
     n_samples: int = modal.parameter(default=3)
     max_tokens: int = modal.parameter(default=1024)
-    temperature: float = modal.parameter(default=0.0)
+    temperature_x100: int = modal.parameter(default=0)     # 0 == greedy
 
     @modal.enter()
     def _load(self):
@@ -101,7 +103,9 @@ class Agent:
         sp = load_split(Path(BIRD_ROOT) / split, name=split)
         examples = sp.examples[:limit] if limit else sp.examples
 
-        cfg = GenConfig(n=1, temperature=self.temperature, top_p=1.0, max_tokens=self.max_tokens)
+        temperature = self.temperature_x100 / 100.0
+        tool_timeout_s = self.tool_timeout_cs / 100.0
+        cfg = GenConfig(n=1, temperature=temperature, top_p=1.0, max_tokens=self.max_tokens)
 
         def chat_fn(messages):
             outs = self.engine.chat([messages], cfg)
@@ -124,7 +128,7 @@ class Agent:
                     msgs,
                     db_path=db_path,
                     max_turns=self.max_turns,
-                    tool_timeout_s=self.tool_timeout_s,
+                    tool_timeout_s=tool_timeout_s,
                     chat_fn=chat_fn,
                 )
             except Exception as e:
@@ -307,10 +311,10 @@ def run_agentic(
         tensor_parallel_size=tensor_parallel_size,
         max_model_len=max_model_len,
         max_turns=max_turns,
-        tool_timeout_s=tool_timeout_s,
+        tool_timeout_cs=int(round(tool_timeout_s * 100)),
         n_samples=n_samples,
         max_tokens=max_tokens,
-        temperature=temperature,
+        temperature_x100=int(round(temperature * 100)),
     )
     result = agent.solve_batch.remote(split=split, limit=limit, save_as=save_tag)
     predictions = result["predictions"]
