@@ -87,14 +87,15 @@
     "results": {
       "Qwen2.5-Coder-32B-Instruct": {"ex": 0.5867, "delta": 0.0130, "escalation_rate": 0.069, "kept_greedy": 93, "vote_overrode": 13, "note": "STACKING GAIN: +0.52pp over either voting alone OR correction alone (+0.78). Older-gen base has more diversity-at-T=0.7 → voting finds 13 legitimate corrections greedy missed."},
       "Qwen3-Coder-30B-A3B-Instruct": {"ex": 0.6121, "delta": 0.0058, "escalation_rate": 0.066, "kept_greedy": 93, "vote_overrode": 8, "note": "Worked as engineered; 6.6% escalation; vote rarely overrides greedy. Below correction-alone (+0.91pp). Voting itself has near-zero marginal value on this confident base."},
-      "Qwen3.6-27B": {"note": "in flight"}
+      "Qwen3.6-27B": {"ex": 0.6369, "delta": 0.0039, "escalation_rate": 0.048, "kept_greedy": 57, "vote_overrode": 17, "note": "FIRST scaffolding strategy to beat the Qwen3.6 baseline (only positive delta vs 63.30%). Lower escalation rate than Q3-Coder-MoE but higher vote-override rate — when Q3.6 escalates, voting more often finds a better answer."}
     }
   },
 
   "best_per_base": {
-    "Qwen2.5-Coder-32B-Instruct":  {"strategy": "voting OR correction (tied)", "ex": 0.5815, "delta": 0.0078},
-    "Qwen3-Coder-30B-A3B-Instruct":{"strategy": "correction",                  "ex": 0.6154, "delta": 0.0091, "is_overall_best": true},
-    "Qwen3-32B (thinking)":        {"strategy": "fewshot",                     "ex": 0.5476, "delta": 0.0307}
+    "Qwen2.5-Coder-32B-Instruct":  {"strategy": "stacked (B+R2+R3)",           "ex": 0.5867, "delta": 0.0130},
+    "Qwen3-Coder-30B-A3B-Instruct":{"strategy": "correction",                  "ex": 0.6154, "delta": 0.0091},
+    "Qwen3-32B (thinking)":        {"strategy": "fewshot",                     "ex": 0.5476, "delta": 0.0307},
+    "Qwen3.6-27B":                 {"strategy": "stacked (B+R2+R3)",           "ex": 0.6369, "delta": 0.0039, "is_overall_best": true, "note": "Best result in entire matrix — first strategy to beat Q3.6 baseline."}
   },
 
   "key_insights": [
