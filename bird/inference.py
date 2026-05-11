@@ -40,16 +40,31 @@ class VLLMEngine:
         download_dir: str | None = None,
         trust_remote_code: bool = True,
         tokenizer: str | None = None,
+        enforce_eager: bool = False,
+        max_num_batched_tokens: int | None = None,
+        attention_backend: str | None = None,
     ):
         from vllm import LLM  # noqa: WPS433  (lazy import on purpose)
 
         self.model = model
-        # `tokenizer` overrides vLLM's default of loading the tokenizer from
-        # `model`'s path. Needed for SFT'd checkpoints whose saved tokenizer
-        # files use a different transformers-version format than our eval
-        # image — pass the original HF id (e.g. "Qwen/Qwen2.5-Coder-32B") to
-        # load a known-good tokenizer while still serving the SFT'd weights.
-        llm_kwargs = dict(
+        # Optional kwargs:
+        #   tokenizer — override vLLM's default of loading the tokenizer from
+        #     `model`'s path. Needed for SFT'd checkpoints whose saved tokenizer
+        #     files use a different transformers-version format than our eval
+        #     image — pass the original HF id (e.g. "Qwen/Qwen2.5-Coder-32B").
+        #   max_num_batched_tokens — Q3.6's Gated DeltaNet cache requires 2096
+        #     alignment; vLLM's default 8192 silently breaks generation.
+        #   attention_backend — force "FLASH_ATTN" on Q3.6 to bypass flashinfer
+        #     JIT compile + FP8/DeepGEMM auto-select paths on B200.
+        extra_kwargs: dict = {}
+        if tokenizer:
+            extra_kwargs["tokenizer"] = tokenizer
+        if max_num_batched_tokens is not None:
+            extra_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+        if attention_backend is not None:
+            extra_kwargs["attention_backend"] = attention_backend
+
+        base_kwargs = dict(
             model=model,
             tensor_parallel_size=tensor_parallel_size,
             max_model_len=max_model_len,
@@ -58,10 +73,18 @@ class VLLMEngine:
             enable_prefix_caching=enable_prefix_caching,
             download_dir=download_dir,
             trust_remote_code=trust_remote_code,
+            enforce_eager=enforce_eager,
         )
-        if tokenizer:
-            llm_kwargs["tokenizer"] = tokenizer
-        self._llm = LLM(**llm_kwargs)
+        try:
+            self._llm = LLM(**base_kwargs, **extra_kwargs)
+        except TypeError as e:
+            # Older vllm versions may not accept attention_backend as an LLM
+            # kwarg — env var already set in image for those cases.
+            if "attention_backend" in str(e):
+                extra_kwargs.pop("attention_backend", None)
+                self._llm = LLM(**base_kwargs, **extra_kwargs)
+            else:
+                raise
 
     def chat(self, conversations: Sequence[list[dict]], cfg: GenConfig) -> list[GenOutput]:
         """Run a batch of chat-message lists through vLLM.
