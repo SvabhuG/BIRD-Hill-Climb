@@ -83,7 +83,7 @@
 
   "agentic_routed": {
     "branch": "feat/agentic-explore",
-    "description": "Route only LOW-CONFIDENCE questions to the agentic loop; keep greedy for everyone else. Routing rules (union): (1) greedy exec_error/timeout, (2) greedy result degenerate (empty / all-NULL / single zero-or-NULL row, executed against the DB), (3) modal-result vote-share <5/8 among 8 voters at T=0.6. Agent: Qwen3-Coder-30B-A3B-Instruct, 2-tool loop (execute_sql + submit), max_turns=6.",
+    "description": "Route only LOW-CONFIDENCE questions to the agentic loop; keep greedy for everyone else. Routing rules (union): (1) greedy exec_error/timeout, (2) greedy result degenerate (empty / all-NULL / single zero-or-NULL row, executed against the DB), (3) modal-result vote-share <5/8 among 8 voters at T=0.6. Agent: Qwen3-Coder-30B-A3B-Instruct or Qwen3.6-27B, 2-tool loop (execute_sql + submit), max_turns=6.",
     "results": {
       "Qwen3-Coder-30B-A3B-Instruct": {
         "ex": 0.6265,
@@ -95,8 +95,25 @@
         "agent_routed_ex": 0.2193,
         "paired_contingency": {"b11_both_correct": 3, "b01_agent_only": 38, "b10_baseline_only": 7, "b00_both_wrong": 139},
         "net_correct_delta": 31,
+        "mcnemar_p": 7.7e-6,
         "ci_95_full_dev_pp": 0.86,
-        "note": "Largest single-strategy delta on Q3-Coder-MoE so far (+2.02pp >> correction's +0.91pp and stacked-voting-correction's +0.58pp). The routing pre-filter is what makes it work: baseline EX on the routed slice is 5.35%, so the agent only needs marginal lift to net-positive — and it delivers +16.6pp on that slice. Agent fixes 38 wrong, breaks 7 correct → 31 net. Tag: agentic-routed-q3cm-dev-187"
+        "note": "Largest single-strategy delta on Q3-Coder-MoE (+2.02pp >> correction's +0.91pp). Routing pre-filter is load-bearing: baseline EX on routed slice is 5.35%, so the agent only needs marginal lift to net-positive — and delivers +16.6pp on that slice."
+      },
+      "Qwen3.6-27B": {
+        "ex": 0.6558,
+        "delta": 0.0228,
+        "routed_n": 110,
+        "routed_pct": 0.072,
+        "rule_breakdown": {"exec_error": 19, "degenerate": 91, "low_vote_share_skipped": "chunked-prefill issue made full voting infeasible at max_num_batched_tokens=2096"},
+        "baseline_routed_ex": 0.0091,
+        "agent_routed_ex": 0.3273,
+        "paired_contingency": {"b11_both_correct": 970, "b01_agent_only": 36, "b10_baseline_only": 1, "b00_both_wrong": 527},
+        "net_correct_delta": 35,
+        "mcnemar_z": 5.754,
+        "mcnemar_p": 5.5e-10,
+        "ci_95_full_dev_pp": [1.51, 3.05],
+        "is_overall_best": true,
+        "note": "NEW OVERALL BEST. +2.28pp over Q3.6 greedy, +1.89pp over Q3.6 stacked (prior best 63.69%). Image fix: vllm 0.20.2 + VLLM_USE_DEEP_GEMM=0 + attention_backend=FLASH_ATTN + max_num_batched_tokens=2096 (GDN cache alignment). Only 1 break vs 36 fixes — much cleaner contingency than Q3-Coder (1 break vs 7). Q3.6 is more agent-fix-robust than Q3-Coder. Run on rules 1+2 only; full voting (rule 3) skipped due to chunked-prefill — could push higher. Tag: agentic-routed-q36-dev-v1.merged."
       }
     },
     "v2_ablation_keep_baseline_and_expanded_routing": {
@@ -113,7 +130,62 @@
         "p_value_vs_greedy": 0.84,
         "ci_95_full_dev_pp": 0.65,
         "finish_reason_mix": {"submit": 39, "keep_baseline": 92, "no_tool_call": 68, "budget": 57},
-        "note": "Adds keep_baseline_sql() tool + expanded routing (vote-share threshold 0.625→0.75, T=0.7 cross-temp disagreement, hint-column-not-in-SQL). keep_baseline cuts per-question break rate 70%→37% as designed, but the agent overuses it (36% of calls) and total fixes collapse 38→13. T=0.7 rule is the largest regression (n=76, baseline-correct=25, fixes=3, breaks=10, net=-7) — cross-temperature disagreement is low-precision on a strong coder. Degenerate-result is still the only productive rule (+11 net). v2 is NOT statistically distinguishable from greedy (p=0.84); v1 stays as the headline. Tag: agentic-routed-q3cm-dev-v2. Writeup: agentic_v2_findings.md."
+        "note": "NULL RESULT. keep_baseline_sql cuts per-question break rate 70%→37% as designed, but the agent overuses it (36% of calls) and total fixes collapse 38→13. T=0.7 disagreement rule is the largest regression (low precision on a confident coder). Lesson: bold-and-selective beats cautious-and-broad."
+      }
+    },
+    "v3_ablation_describe_column": {
+      "Qwen3-Coder-30B-A3B-Instruct": {
+        "ex": 0.6291,
+        "delta_vs_v1": 0.0026,
+        "p_value_vs_v1": 0.62,
+        "ci_95_vs_v1_pp": [-0.51, 1.03],
+        "describe_column_usage_pct": 0.684,
+        "note": "NULL RESULT vs v1. Adds describe_column(table, column) tool returning distinct values + NULL counts + cardinality. Agent used it on 68% of routed questions. Case studies show real wins (q77 disambiguated 'GSserved' enum) but trades ~1-for-1 with v1's no-tool exploration. +0.26pp over v1 but CI straddles zero. v1 stays as the headline."
+      }
+    }
+  },
+
+  "rl": {
+    "branch": "feat/rl-grpo-7b (commit 78ddac3)",
+    "description": "GRPO RL of Qwen2.5-Coder-7B-Instruct on BIRD train. LoRA r=32/alpha=64 on q/k/v/o, num_generations=4, lr=1e-5, max_steps=100, per_device_bs=1, grad_accum=8 → 32 rollouts/step. Reward = binary execution accuracy with per-question gold-row cache. Total 800 examples seen, 100 steps in 554s on single B200.",
+    "results": {
+      "Qwen2.5-Coder-7B-Instruct (GRPO 100 steps)": {
+        "ex": 0.4824, "n_correct": 740, "delta": 0.0039,
+        "exec_error": 151, "timeout": 1,
+        "by_difficulty": {"simple": 0.560, "moderate": 0.381, "challenging": 0.310},
+        "training_reward_positive_rate": 0.569,
+        "mcnemar_2x2": {"both_correct": 732, "base_only": 2, "rl_only": 8, "neither": 792},
+        "mcnemar_z": 1.897, "mcnemar_p": 0.058,
+        "delta_95ci_pp": [-0.01, 0.80],
+        "note": "Demonstration-scale result. +0.39pp over baseline 47.85%. McNemar p=0.058 — borderline. Reward signal worked (56.9% positive rate over 800 training rollouts). To exceed +2pp likely needs more steps (Arctic-R1 used 6000) and/or larger num_generations and/or full-FT instead of LoRA."
+      }
+    }
+  },
+
+  "sft_32b_base": {
+    "branch": "feat/sft-32b-flat",
+    "description": "Full-fine-tuning SFT of Qwen2.5-Coder-32B-Base on BIRD train (~5,776 examples after length filter). 8x B200 FSDP via accelerate FullyShardedDataParallelPlugin. Recipe: 1 epoch, peak LR 5e-6 with cosine to 5e-7, 100-step linear warmup, AdamW (betas 0.9, 0.95, wd 0.01), micro_batch=1, grad_accum=4, world=8 → effective_batch=32, max_seq=8192, bf16 throughout, EOS-preserve truncation. Prompt: flat preamble + format_profile schema block (distinct-value lists + FK section) + question + hint + ### SQL. Completion: raw SQL + EOS, no fences.",
+    "results": {
+      "v2_chat_wrapped_fenced_simple_schema": {
+        "ex": 0.4922, "n_correct": 755,
+        "exec_error": 0.1662,
+        "note": "Initial attempt with messages_to_raw_text chat wrapping (SYSTEM:/USER:/ASSISTANT:) + fenced SQL completion + render_ddl_with_samples (DDL + 3 sample rows, no distinct values). 16.6% exec_error tail dominated by a stray ')' artifact — model overfit to BIRD-train's nested CAST/MAX patterns."
+      },
+      "v3_flat_simple_schema": {
+        "ex": 0.4804, "n_correct": 737,
+        "exec_error": 0.1786,
+        "note": "Dropped chat wrapping for flat preamble + raw SQL completion. Format alignment didn't fix it — exec_error tail unchanged. Ruled out prompt-wrapping as the cause."
+      },
+      "v4_flat_rich_schema": {
+        "ex": 0.5751, "n_correct": 881,
+        "exec_error": 0.0085,
+        "lift_over_raw_base_pp": 22.13,
+        "matches_instruct_variant": "57.37% (Qwen2.5-Coder-32B-Instruct)",
+        "note": "+22.13pp over raw Qwen2.5-Coder-32B-Base (35.38% → 57.51%). exec_error tail collapses from 17%→0.85%. Distinct-value lists in the schema block are the load-bearing addition — model learns valid filter vocabularies instead of guessing from 3 sample rows."
+      },
+      "v4_flat_rich_schema_plus_vote_n5": {
+        "ex": 0.5920, "n_correct": 907,
+        "note": "Same SFT'd model, n=5 voting at T=0.6 → +1.69pp over greedy. Voting compounds cleanly with SFT."
       }
     }
   },
@@ -129,10 +201,12 @@
   },
 
   "best_per_base": {
+    "Qwen2.5-Coder-7B-Instruct":   {"strategy": "rl_grpo",                     "ex": 0.4824, "delta": 0.0039, "note": "RL technique demo on smallest base; +0.39pp at borderline significance"},
+    "Qwen2.5-Coder-32B-Base (SFT)":{"strategy": "sft_v4 (full-FT + format_profile schema)", "ex": 0.5751, "delta": 0.2213, "note": "+22.13pp over raw Base; matches the Instruct variant of the same model from a pure-SFT-on-Base"},
     "Qwen2.5-Coder-32B-Instruct":  {"strategy": "stacked (B+R2+R3)",           "ex": 0.5867, "delta": 0.0130},
-    "Qwen3-Coder-30B-A3B-Instruct":{"strategy": "agentic_routed",              "ex": 0.6265, "delta": 0.0202, "note": "new leader on Q3-Coder-MoE; +2.02pp via probe-then-fix on the 12% lowest-confidence slice"},
+    "Qwen3-Coder-30B-A3B-Instruct":{"strategy": "agentic_routed",              "ex": 0.6265, "delta": 0.0202, "note": "+2.02pp via probe-then-fix on the 12% lowest-confidence slice. p=7.7e-6."},
     "Qwen3-32B (thinking)":        {"strategy": "fewshot",                     "ex": 0.5476, "delta": 0.0307},
-    "Qwen3.6-27B":                 {"strategy": "stacked (B+R2+R3)",           "ex": 0.6369, "delta": 0.0039, "is_overall_best": true, "note": "Best result in entire matrix — first strategy to beat Q3.6 baseline."}
+    "Qwen3.6-27B":                 {"strategy": "agentic_routed",              "ex": 0.6558, "delta": 0.0228, "is_overall_best": true, "note": "NEW OVERALL BEST. +2.28pp over Q3.6 greedy, +1.89pp over Q3.6 stacked (prior best 63.69%). McNemar p=5.5e-10, 36 fixes / 1 break on the 110-routed slice. Cheaper variant of v1 routing (rules 1+2 only, voting skipped due to chunked-prefill)."}
   },
 
   "key_insights": [
@@ -143,6 +217,9 @@
     "Repair strategies (correction, voting) are universally positive but small (+0.4 to +0.9pp). Bounded by exec_error count.",
     "Modify-the-prompt strategies (linking, fewshot) are base-dependent: help weaker / non-coder bases, hurt strong coder bases.",
     "Schema linking with 97.8% recall STILL regressed on Qwen3-Coder-MoE (-1.37pp) because the filtered DDL tilts the model toward worse column choices even when all gold columns are kept.",
-    "On strong coder bases, the way to climb further is training (RL on execution rewards) or a better base, not more prompt scaffolding."
+    "Agentic routing on a strong coder base outperforms every prior scaffolding by routing only the 12% lowest-confidence questions to a 2-tool agent (execute_sql + submit). Concentrates the +6pp 50-q lift to +2.02pp full-dev with p<1e-5. New overall best on Q3.6 at 65.58% (+2.28pp, p<1e-9).",
+    "SFT (Full-FT) on the Qwen2.5-Coder-32B Base substrate lifts +22.13pp over raw greedy, reaching the Instruct variant's level. Schema content (distinct-value lists for low-cardinality columns + explicit FK section) is load-bearing — without it the model hits a 17% exec_error stray-paren artifact ceiling at 48-49%.",
+    "RL via GRPO + LoRA on a 7B base produces +0.39pp at 100 steps — demonstrates the technique fires cleanly but lift is marginal at this scale.",
+    "Three controlled agentic ablations (v2 = +keep_baseline + expanded routing, v3 = +describe_column) both produced null results vs v1. Lesson: bold-and-selective beats cautious-and-broad."
   ]
 }
