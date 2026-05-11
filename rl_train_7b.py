@@ -569,13 +569,22 @@ def main(
     smoke: bool = False,
     output_dir: str = RL_OUTPUT_DIR,
 ):
-    """Spawn GRPO training. `--smoke True` runs the 2-step / 20-q validation."""
+    """Run GRPO training. `--smoke` does the 2-step / 20-q validation.
+
+    Uses `.remote()` (blocking) instead of `.spawn()` so the local entrypoint
+    stays connected to the function for its entire lifetime — empirically,
+    `.spawn()` from a local entrypoint under `--detach` was getting killed
+    mid-run after ~3.5 minutes (likely client-disconnect tied to local exit).
+    With `.remote()` + `--detach`, the local process holds the connection;
+    if the user kills the local CLI, `--detach` keeps the GPU function alive.
+    """
+    import json as _json
     tag = "SMOKE" if smoke else "FULL"
     print(f"=== GRPO RL of {MODEL_ID} on BIRD ({tag}) ===")
     print(f"  num_examples={num_examples}  max_steps={max_steps}  lr={learning_rate}")
     print(f"  num_generations={num_generations}  output_dir={output_dir}")
 
-    fc = train_rl_7b.spawn(
+    result = train_rl_7b.remote(
         num_examples=num_examples,
         max_steps=max_steps,
         learning_rate=learning_rate,
@@ -583,9 +592,8 @@ def main(
         output_dir=output_dir,
         smoke=smoke,
     )
-    print(f"\nSpawned function call: {fc.object_id}")
-    print(f"Tail logs:        modal app logs {APP_NAME}")
-    print(f"Or fetch result:  modal.FunctionCall.from_id('{fc.object_id}').get()")
+    print("\n=== RL TRAINING RESULT ===")
+    print(_json.dumps(result, indent=2))
 
 
 @app.local_entrypoint()
