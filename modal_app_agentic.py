@@ -49,14 +49,18 @@ gpu_image = (
 
 # Q3.6-27B has a hybrid Gated DeltaNet architecture (model type `qwen3_5`) that
 # the standard image's transformers==4.57.0 doesn't recognize. The known-working
-# pin per main repo's matrix note is vllm 0.19.0 + transformers 5.8.0 +
-# FLASH_ATTN backend. Use this image specifically for Q3.6 runs.
+# pin is vllm 0.20.2 + transformers 5.8.0 + FLASH_ATTN backend, with DeepGEMM
+# auto-selection disabled at runtime via env var.
 #
-# vllm 0.20.2 auto-selects DeepGEMM for Qwen3.6's FP8-friendly kernels on B200
-# and fails to initialize. Pin to 0.19.0 (pre-DeepGEMM auto-selection) and set
-# VLLM_USE_DEEP_GEMM=0 + VLLM_ATTENTION_BACKEND=FLASH_ATTN to disable FP8 fast
-# paths. Also pass max_num_batched_tokens=2096 at the LLM constructor — the
-# default 8192 silently breaks Qwen3.5/3.6 Gated DeltaNet (GDN) cache alignment.
+# Tried vllm 0.19.0 (pre-DeepGEMM auto-selection) but it pins transformers<5
+# and its huggingface_hub 1.14.0 removes `is_offline_mode` which transformers
+# 5.8.0 still imports — irreconcilable.
+#
+# Three-part fix for vllm 0.20.2's DeepGEMM crash on B200/Qwen3.6:
+#   1. drop the `deep_gemm` pip dep (source-only, can't pip-build)
+#   2. set VLLM_USE_DEEP_GEMM=0 + VLLM_ATTENTION_BACKEND=FLASH_ATTN env vars
+#   3. pass max_num_batched_tokens=2096 at the LLM ctor — required for GDN
+#      cache alignment; vLLM's default 8192 silently breaks Q3.5/3.6.
 #
 # `qwen3_5`'s Gated DeltaNet requires nvcc at runtime for CUDAGraph capture, so
 # we base on the CUDA-devel image (which ships /usr/local/cuda + nvcc) instead
@@ -69,8 +73,15 @@ gpu_image_q36 = (
         "nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python=_PY,
     )
     .apt_install("git")
+    # vllm 0.19.0 pins transformers<5, but transformers 5.8.0 is the only
+    # version recognizing the `qwen3_5` model_type for Q3.6. The two libs'
+    # huggingface_hub expectations diverge (vllm 0.19 + hf_hub 1.x removes
+    # `is_offline_mode`, which transformers 5.8.0 still imports). So we
+    # use vllm==0.20.2 here (compatible w/ transformers 5.8.0) and instead
+    # disable DeepGEMM at *runtime* via env vars + force FLASH_ATTN, plus
+    # set max_num_batched_tokens=2096 at the LLM ctor for GDN alignment.
     .pip_install(
-        "vllm==0.19.0",
+        "vllm==0.20.2",
         "transformers==5.8.0",
         "tqdm",
         "pydantic>=2",
@@ -817,6 +828,7 @@ class SamplerQ36:
         top_p: float,
         save_as: str,
         vote_timeout_s: float = 15.0,
+        limit: int = 0,
     ) -> dict:
         from bird.data import load_split
         from bird.inference import GenConfig
@@ -825,8 +837,9 @@ class SamplerQ36:
         from bird.voting import vote as _vote
 
         sp = load_split(Path(BIRD_ROOT) / split, name=split)
-        examples = sp.examples
-        print(f"[voting-q36] preparing prompts for {len(examples)} questions")
+        examples = sp.examples[:limit] if limit else sp.examples
+        print(f"[voting-q36] preparing prompts for {len(examples)} questions"
+              + (f" (limit={limit})" if limit else ""))
 
         schema_cache: dict = {}
         convos: list[list[dict]] = []
@@ -898,9 +911,13 @@ def run_voting_q36(
     save_as: str = "voting-qwen3.6-27b-dev-full.json",
     tensor_parallel_size: int = 1,
     max_model_len: int = 16384,
+    limit: int = 0,
 ):
-    """Q3.6-specific voting entrypoint (uses gpu_image_q36)."""
-    print(f"[voting-q36] {model} split={split} n_votes={n_votes} T={temperature}")
+    """Q3.6-specific voting entrypoint (uses gpu_image_q36).
+
+    Pass `--limit N` for a smoke test (N questions, not a full split).
+    """
+    print(f"[voting-q36] {model} split={split} n_votes={n_votes} T={temperature} limit={limit}")
     sampler = SamplerQ36(
         model_name=model,
         tensor_parallel_size=tensor_parallel_size,
@@ -909,7 +926,7 @@ def run_voting_q36(
     summary = sampler.vote_full.remote(
         split=split, n_votes=n_votes, max_tokens=max_tokens,
         temperature=temperature, top_p=top_p, save_as=save_as,
-        vote_timeout_s=vote_timeout_s,
+        vote_timeout_s=vote_timeout_s, limit=limit,
     )
     print(json.dumps(summary, indent=2))
 
