@@ -95,6 +95,37 @@ Paired contingency: **36 fixes vs 1 break** → +35 net. Much cleaner than Q3-Co
 
 This is run on rules 1+2 only — Q3.6 voting (rule 3) was skipped because `max_num_batched_tokens=2096` (a Q3.6 GDN-alignment requirement) made full-dev voting infeasible at 8 candidates. Adding it would likely push higher.
 
+### Where the agent leaks — finish-reason audit on the Q3.6 headline run
+
+The agent's 110-question run on Q3.6 broke down as:
+
+| Finish reason | n | EX rate | Notes |
+|---|---|---|---|
+| Clean `submit` | 38 (34.5%) | **68.4% correct** | The agent's sweet spot |
+| `no_tool_call` (text emitted, no parseable submit) | 67 (60.9%) | 14.9% correct | **The biggest leak** |
+| `budget` (max_turns=6 exhausted) | **5 (4.5%)** | **0% correct** (all exec_error) | Tiny absolute count |
+
+Budget exhaustion is *not* the main bottleneck — only 5/110 hit `max_turns`. Bumping `max_turns` from 6 to 10 would rescue at most ~5/1534 = 0.33pp.
+
+**The dominant leak is `no_tool_call`** — and inside that, 76% are *format compliance* failures, not reasoning failures:
+
+| `no_tool_call` sub-category | n | % | What happened |
+|---|---|---|---|
+| Raw SQL in text, no fence, no JSON | 29 | 43.3% | Model thinks aloud with SQL embedded in prose; driver regex grabs a probe, not the intended final |
+| Fenced ` ```sql` block, no submit JSON wrapper | 22 | 32.8% | Has the SQL, never committed via submit tool |
+| Truncated mid-tool-call JSON (max_tokens=1024) | 8 | 11.9% | Hit max_tokens during JSON generation |
+| Multiple `execute_sql` calls, no final submit | 5 | 7.5% | Kept probing, ran out of text |
+| Malformed submit JSON | 2 | 3.0% | Syntax errors in the JSON wrapper |
+
+51 of 67 (76%) `no_tool_call` cases had SQL the model decided on; it just didn't wrap it in `{"tool": "submit", "args": {"sql": "..."}}`. **The agent's SQL reasoning was fine — its output-format compliance was the bottleneck.**
+
+For comparison, the same agent on Q3-Coder-30B-A3B-Instruct was much heavier on budget exhaustion (44/187 = 23.5%, vs Q3.6's 4.5%) — Q3-Coder gets stuck in probe loops while Q3.6 commits to submit faster. That's a major reason Q3.6's contingency is so clean (36 fixes / 1 break vs Q3-Coder's 38/7).
+
+Fixes worth trying (not done in this take-home):
+- Bump `max_tokens` 1024 → 2048 (kills the 12% truncation cases outright)
+- vLLM structured-outputs / grammar-constrained decoding (guarantees well-formed submit tool calls)
+- System-prompt reinforcement: "you MUST emit a submit tool call; raw SQL in prose will be misinterpreted"
+
 ### Three agentic ablations — all null vs v1
 
 We tested two plausible-sounding improvements and one tool addition, and all produced null results vs the lean v1 baseline. **Bold-and-selective beats cautious-and-broad.**
