@@ -940,7 +940,7 @@ def run_agentic_routed_q36(
     max_turns: int = 6,
     tool_timeout_s: float = 10.0,
     n_samples: int = 3,
-    max_tokens: int = 1024,
+    max_tokens: int = 2048,  # bumped from 1024 to kill the 12% mid-JSON truncation cases observed in v1
     temperature: float = 0.0,
     save_as: str = "",
     tensor_parallel_size: int = 1,

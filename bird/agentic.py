@@ -169,7 +169,22 @@ Rules:
   back to you; reason briefly on what changed, then either refine and try
   again, or call submit.
 - Only the SQL inside submit's `args.sql` is graded. Make it a single
-  SELECT (or WITH ... SELECT) ending without trailing prose."""
+  SELECT (or WITH ... SELECT) ending without trailing prose.
+
+CRITICAL OUTPUT FORMAT — read carefully:
+Every message you produce MUST end with exactly one ```json ... ``` block
+containing a tool call. The block looks like:
+
+  ```json
+  {"tool": "submit", "args": {"sql": "SELECT ..."}}
+  ```
+
+You may write reasoning before the block, but the final thing in your
+message MUST be the JSON block. SQL written in plain prose, in a bare
+```sql block without a JSON wrapper, or in any other format will NOT be
+parsed and your answer will be lost. When you're ready to commit your
+answer, do not say "I will submit" — actually emit the submit JSON.
+"""
 
 
 AGENT_USER_V1 = """\
