@@ -172,6 +172,32 @@ Demonstration-scale. Reward signal fired cleanly (56.9% positive rate over 800 t
 
 We attempted full 32B-scale RL but hit infra blockers (memory math: 32B trainer + 32B vLLM rollout doesn't fit single B200; FSDP+PEFT composition bugs at 32B; veRL/TRL/hand-rolled all needed dedicated trainer+rollout GPU pools we didn't have).
 
+## Ideas we ruled out (or didn't have time to try)
+
+**Tried, killed by data:**
+- **Chain-of-thought** — regressed −1.6 to −2.4pp on every coder base (commitment bias: the NL plan locks the model into wrong column / value choices that free-form SQL would have re-thought)
+- **Schema linking** with 97.8% recall — still regressed −1.4pp on Qwen3-Coder-MoE and −4.2pp on Q3.6. Filtered DDL tilts strong bases toward worse column choices even when all gold columns are kept
+- **Voting at T=1.0** (MoE-diversity hypothesis) — *worse* than T=0.6 voting (+0.13 vs +0.45pp). Killed the "MoE experts add diversity" hypothesis
+- **Few-shot on strong coders** — helps non-coders (+3.07pp on Q3-32B-thinking) but neutral-to-negative on Q3-Coder/Q3.6 (anchor bias)
+- **Agentic v2 (keep_baseline + expanded routing)** — broke break-rate fix interacts negatively with expanded routing. Null result (p=0.84)
+- **Agentic v3 (+describe_column tool)** — tool got used on 68% of routed q with real isolated wins, but traded ~1-for-1 with v1's no-tool exploration. Null vs v1 (p=0.62)
+- **SFT v2/v3 (chat-wrapped or flat with simple schema)** — both stuck at ~48-49% with a 17% exec_error tail dominated by a specific stray-`)` artifact. Format wrapping wasn't the cause; schema content was
+
+**Tried, killed by infra:**
+- **vLLM 0.20.2 default-config Qwen3.6** — DeepGEMM auto-selected, init crash on B200. Fix: `VLLM_USE_DEEP_GEMM=0` + `attention_backend=FLASH_ATTN` + `max_num_batched_tokens=2096`
+- **Q3.6 voting at n=8** for the agentic-routing rule 3 — chunked-prefill collapsed throughput to 1.3 s/it at the small `max_num_batched_tokens=2096` Q3.6 needs. Workaround would be splitting into 4-5 separate Modal invocations
+- **Full 32B RL** (TRL/veRL/hand-rolled FSDP+PEFT) — 32B trainer + 32B vLLM rollout doesn't fit a single B200. Needed a dedicated trainer-pool + rollout-pool split we couldn't reliably allocate. Burned ~$130 of compute on infra failures across three frameworks before pivoting to 7B
+- **vLLM 0.19 pin for Q3.6** — broke `huggingface_hub.is_offline_mode` import. Rolled back to 0.20.2 + runtime env-var disable of DeepGEMM
+
+**Didn't try (time / scope):**
+- **RL on the SFT'd 32B Base** — the obvious follow-up; Arctic-R1 recipe applied to our 57.51% v4 substrate. Needs trainer/rollout GPU split
+- **Grammar-constrained tool-call decoding** via vLLM's `guided_json` — would guarantee well-formed submit JSON and likely close most of the 67/110 `no_tool_call` leak we identified on Q3.6
+- **Spider augmentation for SFT** — Arctic-R1 used BIRD + Spider together; we used BIRD only. Probably worth +2-3pp at the SFT stage
+- **Multi-epoch SFT** — we did 1 epoch / 280 steps. Arctic-R1 used 3 epochs at 32B. Risk: overfitting on BIRD train's idioms (we already saw a hint of that in the stray-paren artifact)
+- **Routing-on-SFT** — applying v1 agentic routing to the SFT'd 32B model. Probably the highest-EV stack of our two best findings
+- **Self-eval / verifier-based filtering** — a small LM rating "does this SQL answer the question?" — published BIRD work uses this; we judged ROI too low for take-home time
+- **Result-cardinality-vs-question-type mismatch** as a routing signal — "question asks for `the school` (singular) but result has 12 rows → route" — would expand recall on the wrong-but-valid bucket
+
 ## What we'd do with more time
 
 1. **Re-run Q3.6 agentic with full voting (rule 3).** The 65.58% number is rules-1+2-only because `max_num_batched_tokens=2096` chunked-prefill made full-dev voting at n=8 infeasible. Splitting the run into 4-5 separate Modal invocations sidesteps the issue. Expected to push to ~66-66.5%.
@@ -184,10 +210,38 @@ We attempted full 32B-scale RL but hit infra blockers (memory math: 32B trainer 
 
 5. **Layer agentic-routing on top of the SFT'd model.** Two of the three best findings stacked — SFT lifts the substrate, agentic routing harvests the last few wrong-but-valid cases. Expected combined: 57.51% + ~2pp = ~60% from a 7B-tier compute budget, or 65% + 2pp = ~67% if we had a Q3.6 SFT.
 
-## Tooling
+## Open questions and things I'm newly curious about
+
+- **Does v1 routing transfer to the SFT'd Q3.6?** Untested. If our SFT-Base recipe applied to Q3.6 lifts it to, say, 67-68%, then agentic routing on top would target a smaller routed set (because the base has fewer wrong-but-valid cases) but with the same "near-pure wrong-baseline slice" property. Could compound cleanly.
+- **Why does Q3.6 commit to submit so much faster than Q3-Coder?** (4.5% vs 23.5% budget-exhaustion). Both are coder-instruct models in the same generation; one is dense Q3.6, one is MoE. The architectural difference suggests dense models are more decisive at the tool-call boundary — but n=2 is hardly a finding. Worth replicating on more bases.
+- **Is the stray-`)` SFT artifact transferable?** It's a specific overfit to BIRD-train's frequent `MAX(CAST(... AS REAL) / ...)` pattern. We saw it disappear when we switched to format_profile schema. Would a different artifact appear on a different schema renderer? Hard to know without controlled ablations.
+- **What's the saturation curve of agentic routing?** v1 lifts +2pp; v2/v3 ablations are null. We didn't try v4-style tools (value retrieval, table inspection). At what point does adding tools regress in the way v2/v3 did? Three data points is too few.
+- **vLLM Blackwell quirks** — we hit 5+ subtle pin/config issues on B200 (DeepGEMM auto-select, GDN cache alignment, flashinfer JIT, kv-cache-dtype incompatibilities). Modal abstracts away the host but not the GPU-arch-aware library stack. Curious whether other inference engines (sglang, TRT-LLM) avoid these.
+
+## Next experiments (in priority order)
+
+The single highest-EV experiment we'd run next:
+
+1. **Agentic RL.** Combine the two best findings of this take-home: the agentic loop and the GRPO training pipeline. Instead of using a fixed-prompt agent, train the *agent's* policy with RL where the reward is the merged full-dev EX of its tool-call trajectory. Specifically:
+   - Initial policy = SFT'd 32B-Base (57.51% greedy)
+   - Generate tool-call trajectories on routed questions, score the final SQL with our binary-execution reward, GRPO-update the policy
+   - This trains the model to *use* execute_sql, *interpret* probe results, and *commit* to a submit tool-call — exactly the failure modes we saw in the no_tool_call audit (76% format-compliance failures)
+   - The trick: rollouts are multi-turn (each rollout is a full agent loop), so GRPO group-size and credit-assignment need adapting. Recent work like "RL with tool use" (Snowflake's Arctic-R1 follow-up + the StepRL line) gives a recipe
+   - Expected gain: should close most of the +2.28pp ceiling our prompt-only agent hit on Q3.6, *plus* recover the no_tool_call leak (60.9% of cases) into more clean submits. Realistic projection: 65.58% → 68-70% on Q3.6 substrate
+
+2. **Routing-on-SFT.** Apply v1 agentic routing on top of our SFT'd Qwen2.5-Coder-32B-Base (57.51% greedy). The SFT'd model has a different wrong-but-valid distribution than Q3.6, so the routed set composition will be different. Expected: +2pp → ~60%, validating that routing transfers to trained substrates.
+
+3. **Full v1 routing on Q3.6** (with rule 3). Split voting into 4-5 sequential Modal invocations to sidestep the chunked-prefill stall we hit. Routed set grows ~110 → ~150-180, expected lift +0.5-1pp on top of the current 65.58%.
+
+4. **Multi-epoch SFT + Spider augmentation.** 1 epoch / BIRD-train-only → 3 epochs / BIRD + Spider. Pre-RL recipe Arctic-R1 uses. Expected: 57.51% → 62-64% on the SFT'd model alone.
+
+5. **Tool-call grammar constraint.** vLLM `guided_json` on the agent's output. Would force well-formed submit JSON and likely lift the 60.9% no_tool_call rate substantially (76% of those were format failures, not reasoning failures). Cheap to try, possibly +1-2pp on top of agentic-routing.
+
+## Tooling — what made us fast
 
 Everything runs on Modal with persistent Volumes for the BIRD corpus + HF cache + SFT checkpoints + per-run results.
 
+### What we built
 - `modal_app.py` — entry points: `run_baseline`, `run_with_linking`, `run_sft_eval`, `evaluate_predictions`
 - `modal_app_agentic.py` — agent loop entry points: `run_agentic`, `run_agentic_routed`, `run_agentic_routed_q36`, voting helpers
 - `sft_train_32b.py` — 8× B200 FSDP SFT (mp.spawn + accelerate FSDP plugin)
@@ -195,9 +249,24 @@ Everything runs on Modal with persistent Volumes for the BIRD corpus + HF cache 
 - `bird/` — eval harness, schema, prompt builders, agent loop, voting/correction strategies
 - `scripts/` — failure dashboards, run diffs, routing-set builder, McNemar utility
 
-Image pinning matters at the edges:
+### Patterns that paid off
+
+- **Per-question result JSON as the universal currency.** Every cell in the matrix produces a `{ex, n, results: [{question_id, db_id, status, predicted_sql, ...}]}` file on the `bird-results` volume. Once that shape was locked, *everything* downstream — McNemar tests, paired-diff between runs, routing-set construction, failure-mode dashboards — was a 30-line script. The routing-set builder (`scripts/build_routing_set.py`) is literally a set-union over these files. The merge for the agent-routed final EX (`scripts/score_q36_merge.py` style) is a few-line zip-and-substitute over them. **This file format is the single biggest tooling decision** — it made every subsequent experiment a composable step.
+- **Worktree-parallel experiments.** Each strategy lives on its own branch with its own worktree (`feat/agentic-explore`, `feat/sft-32b-flat`, `feat/rl-grpo-7b`, `feat/agentic-describe-column`). Running two experiments concurrently never blocks on git, and `git diff main...feat/X` shows exactly what a strategy adds. Combined with subagents (running their own modal commands in their own worktrees), we ran 3-4 simulations in parallel for the last two hours of the take-home.
+- **Subagents for blast-radius isolation.** The three agentic ablations (v2 keep_baseline, v3 describe_column, Q3.6 retry) each ran in a dedicated subagent + worktree. If a subagent burnt a budget on an infra issue, it didn't take down the main thread. The Q3.6 first attempt hit three image issues in 34 min; the parallel SFT experiments kept running.
+- **The schema profiler port (`bird/exp18_schema.py::format_profile`) was the v4 unlock.** Distinct-value lists for low-cardinality columns + explicit FK section turned a 17% exec_error tail into 0.85%. A 200-line port that recovered 9.5pp.
+- **`scripts/mcnemar.py` paired-contingency stats.** Every "is this lift real?" question gets answered in 2 seconds with a 95% CI and p-value. Saved us from shipping the agentic v2 result as a real lift when it was actually null.
+- **Modal volumes as the cross-machine storage layer.** No re-downloading BIRD (16 GB), no re-downloading model weights (60-120 GB), no re-running baselines. The 22-cell matrix happened *because* every prior result was reusable on the volume.
+
+### Image pinning matters at the edges
 - vLLM 0.11.0 + transformers 4.57.0 works for Qwen2.5/Qwen3-Coder
 - vLLM 0.20.2 + transformers 5.8.0 + `VLLM_USE_DEEP_GEMM=0` + `attention_backend=FLASH_ATTN` + `max_num_batched_tokens=2096` for Qwen3.6-27B (FP8 / DeepGEMM auto-select + GDN cache alignment quirks on B200)
+
+### What I'd do differently next time
+- **Lock the per-question result JSON shape in week 1.** Some early baselines used slightly different keys and required cleanup scripts. A `bird.results.schema` module enforced as the only valid output would have saved an hour of cross-run grief.
+- **Smaller smoke tests for SFT.** Our 50-q `--dry-run` mode tested the FSDP path but didn't catch the data-content artifact (stray-paren) until we ran 1534-q eval. A 200-q SFT + 200-q eval intermediate stage would have caught v2/v3's schema-content gap a full retry-cycle earlier.
+- **Establish the "kill switch" earlier.** SFT v4 was killed twice in our workspace by external CLI activity (probably dashboard Stop clicks during GPU-quota juggling). We lost ~40 min before realizing the pattern. A startup banner explicitly listing "DO NOT STOP THIS APP" would have helped.
+- **Tracked Modal app IDs in a structured log file** rather than chat. By the end we had ~50 app IDs in a 10-experiment run; tying them back to the strategy + branch + commit required scrolling through the conversation. A `runs.jsonl` append-only log would have made post-hoc reproduction trivial.
 
 ## Files
 
