@@ -473,21 +473,24 @@ def _prepare_sft_flat(split: str, limit: int, n_samples: int):
 
     Matches `bird.sft_format.build_sft_prompt` byte-for-byte — same function
     is used at training time, so the SFT'd model sees identical inputs.
+    Uses `profile_database` (with distinct-value lists, row counts, FK section)
+    — the n_samples arg is preserved for API parity but ignored (profile uses
+    the function's defaults: 3 sample rows, 20 distinct values).
     """
     from bird.data import load_split
-    from bird.schema import extract_schema
+    from bird.exp18_schema import profile_database
     from bird.sft_format import build_sft_prompt
 
     sp = load_split(Path(BIRD_ROOT) / split, name=split)
     examples = sp.examples[:limit] if limit else sp.examples
 
-    schema_cache: dict[str, object] = {}
+    profile_cache: dict[str, dict] = {}
     prompts: list[str] = []
     metas: list[dict] = []
     for ex in examples:
-        if ex.db_id not in schema_cache:
-            schema_cache[ex.db_id] = extract_schema(sp.db_path(ex.db_id), ex.db_id, n_samples=n_samples)
-        prompts.append(build_sft_prompt(ex, schema_cache[ex.db_id], n_samples=n_samples))
+        if ex.db_id not in profile_cache:
+            profile_cache[ex.db_id] = profile_database(str(sp.db_path(ex.db_id)))
+        prompts.append(build_sft_prompt(ex, profile_cache[ex.db_id]))
         metas.append({
             "question_id": ex.question_id,
             "db_id": ex.db_id,

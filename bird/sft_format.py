@@ -1,22 +1,22 @@
-"""SFT-Base prompt + completion format (flat, no chat wrapping).
+"""SFT-Base prompt + completion format (flat, no chat wrapping, rich schema).
 
 Training and inference share `build_sft_prompt` so the SFT loss and the eval
-prompt are bytewise-identical. The format is intentionally flat (no
-SYSTEM:/USER:/ASSISTANT: tags) because the Base model wasn't pretrained on
-those shouting tokens — our v1 SFT used `messages_to_raw_text`'s chat wrapping
-and hit a 16.6% exec_error rate dominated by a specific stray-paren artifact,
-which we attribute to the Base model learning weird patterns around the
-unfamiliar chat tokens instead of clean SQL structure.
+prompt are bytewise-identical.
 
-Schema rendering keeps our existing `render_ddl_with_samples` for matrix
-consistency with the baseline cells. Preamble is a short 4-rule instruction.
-SFT target is raw SQL + EOS (no fences) — fences add another unfamiliar token
-pattern for the Base to learn.
+Schema rendering uses `bird.exp18_schema.format_profile` — DDL + row counts +
+sample rows + distinct-value lists for low-cardinality columns + explicit
+foreign-key section. The distinct-value lists are load-bearing: the v3 SFT
+retry confirmed that the prompt-format wrapping is NOT the cause of our
+exec_error tail; the remaining hypothesis is the schema-content gap. Without
+the distinct-value lists, the SFT'd model has to guess valid filter values
+from 3 sample rows and frequently gets them wrong.
+
+Preamble is the short 4-rule instruction (matches the proven recipe's V1).
+SFT target is raw SQL + EOS, no fences.
 """
 from __future__ import annotations
 
 from .data import BirdExample
-from .schema import DatabaseSchema, render_ddl_with_samples
 
 
 INSTRUCTION_PREAMBLE = """You are an expert SQLite SQL developer. Given a database schema and a natural language question, write a SQL query that answers the question.
@@ -34,12 +34,18 @@ Rules:
 INFERENCE_STOPS = ["\n\n###", "\n###"]
 
 
-def build_sft_prompt(example: BirdExample, schema: DatabaseSchema, n_samples: int = 3) -> str:
+def build_sft_prompt(example: BirdExample, profile: dict) -> str:
     """Flat training/inference prompt. Ends with `### SQL\\n` so the model
     continues with SQL immediately. The trailing single newline is load-bearing:
     it matches the boundary the model saw in every training example.
+
+    `profile` is the dict produced by `bird.exp18_schema.profile_database` —
+    callers cache this per db_id (sqlite reads are cheap but distinct-value
+    scans are O(row_count) per column).
     """
-    schema_block = render_ddl_with_samples(schema, n_samples=n_samples).strip()
+    from .exp18_schema import format_profile
+
+    schema_block = format_profile(profile).strip()
     parts = [
         "### Database Schema",
         schema_block,

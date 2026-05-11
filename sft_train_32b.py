@@ -239,7 +239,7 @@ def _train_worker_main(rank: int, world_size: int, args: dict):
     # bird/* is shipped via add_local_python_source. Lazy-imported here so the
     # module can also be imported from CPU contexts without torch.
     from bird.data import BirdExample
-    from bird.schema import extract_schema
+    from bird.exp18_schema import profile_database
     from bird.sft_format import build_sft_completion, build_sft_prompt
 
     if dry_run:
@@ -306,16 +306,18 @@ def _train_worker_main(rank: int, world_size: int, args: dict):
     log(f"BIRD train: {len(all_tasks)} tasks")
 
     # ---- 2. Profile databases ----
-    # Each rank profiles independently — sqlite reads are cheap.
+    # Each rank profiles independently. profile_database is heavier than our
+    # old schema extractor (it scans for distinct values on every low-cardinality
+    # column), but the result is cached per db_id and BIRD only has ~70 dbs.
     db_counts = Counter(t["db_id"] for t in all_tasks)
     log(f"Profiling {len(db_counts)} databases...")
-    schema_cache = {}
-    available_dbs = set()
+    profile_cache: dict[str, dict] = {}
+    available_dbs: set[str] = set()
     for i, db_id in enumerate(db_counts):
         p = train_db_dir / db_id / f"{db_id}.sqlite"
         if p.exists():
             try:
-                schema_cache[db_id] = extract_schema(p, db_id, n_samples=3)
+                profile_cache[db_id] = profile_database(str(p))
                 available_dbs.add(db_id)
             except Exception as e:
                 log(f"  Skip {db_id}: {e}")
@@ -345,7 +347,7 @@ def _train_worker_main(rank: int, world_size: int, args: dict):
     skipped_long = 0
     for idx, task in enumerate(tasks):
         db_id = task["db_id"]
-        schema = schema_cache[db_id]
+        profile = profile_cache[db_id]
 
         ex = BirdExample(
             question_id=task.get("question_id", idx),
@@ -355,7 +357,7 @@ def _train_worker_main(rank: int, world_size: int, args: dict):
             sql=task.get("SQL", ""),
             difficulty=task.get("difficulty"),
         )
-        prompt_text = build_sft_prompt(ex, schema, n_samples=3)
+        prompt_text = build_sft_prompt(ex, profile)
         completion_text = build_sft_completion(ex.sql, tokenizer.eos_token)
 
         prompt_ids = tokenizer.encode(prompt_text, add_special_tokens=False)
