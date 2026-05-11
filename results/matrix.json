@@ -81,6 +81,23 @@
     }
   },
 
+  "rl": {
+    "branch": "feat/rl-grpo-7b (commit 78ddac3)",
+    "description": "GRPO RL of Qwen2.5-Coder-7B-Instruct on BIRD train. LoRA r=32/alpha=64 on q/k/v/o, num_generations=4, lr=1e-5, max_steps=100, per_device_bs=1, grad_accum=8 → 32 rollouts/step. Reward = binary execution accuracy with per-question gold-row cache. Total 800 examples seen, 100 steps in 554s on single B200.",
+    "results": {
+      "Qwen2.5-Coder-7B-Instruct (GRPO 100 steps)": {
+        "ex": 0.4824, "n_correct": 740, "delta": 0.0039,
+        "exec_error": 151, "timeout": 1,
+        "by_difficulty": {"simple": 0.560, "moderate": 0.381, "challenging": 0.310},
+        "training_reward_positive_rate": 0.569,
+        "mcnemar_2x2": {"both_correct": 732, "base_only": 2, "rl_only": 8, "neither": 792},
+        "mcnemar_z": 1.897, "mcnemar_p": 0.058,
+        "delta_95ci_pp": [-0.01, 0.80],
+        "note": "Demonstration-scale result. +0.39pp over baseline 47.85%. McNemar p=0.058 — at the edge of significance, lift just below +2pp target. Reward signal worked (56.9% positive rate over 800 training rollouts; loss is uninformative for GRPO since it's policy-gradient). With 100 steps × 32 rollouts = 3200 gradient signals, only weak update on a 7B base. To exceed +2pp likely needs more steps (Arctic-R1 used 6000) and/or larger num_generations."
+      }
+    }
+  },
+
   "stacked_voting_correction": {
     "branch": "feat/stacked-voting-correction (commit c8d2cd7)",
     "description": "Composed strategy: greedy correction first; only escalate to voting+correction if greedy errored OR returned degenerate result. Inside voting: greedy is candidate-0 (R2: strict-override only), rescued candidates can't outvote originally-valid ones (R3).",
