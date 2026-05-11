@@ -49,8 +49,14 @@ gpu_image = (
 
 # Q3.6-27B has a hybrid Gated DeltaNet architecture (model type `qwen3_5`) that
 # the standard image's transformers==4.57.0 doesn't recognize. The known-working
-# pin per main repo's matrix note is vllm 0.20.2 + transformers 5.8.0 +
+# pin per main repo's matrix note is vllm 0.19.0 + transformers 5.8.0 +
 # FLASH_ATTN backend. Use this image specifically for Q3.6 runs.
+#
+# vllm 0.20.2 auto-selects DeepGEMM for Qwen3.6's FP8-friendly kernels on B200
+# and fails to initialize. Pin to 0.19.0 (pre-DeepGEMM auto-selection) and set
+# VLLM_USE_DEEP_GEMM=0 + VLLM_ATTENTION_BACKEND=FLASH_ATTN to disable FP8 fast
+# paths. Also pass max_num_batched_tokens=2096 at the LLM constructor — the
+# default 8192 silently breaks Qwen3.5/3.6 Gated DeltaNet (GDN) cache alignment.
 #
 # `qwen3_5`'s Gated DeltaNet requires nvcc at runtime for CUDAGraph capture, so
 # we base on the CUDA-devel image (which ships /usr/local/cuda + nvcc) instead
@@ -64,18 +70,19 @@ gpu_image_q36 = (
     )
     .apt_install("git")
     .pip_install(
-        "vllm==0.20.2",
+        "vllm==0.19.0",
         "transformers==5.8.0",
         "tqdm",
         "pydantic>=2",
         "sqlglot>=25",
         "huggingface_hub",
-        # Q3.6-27B ships with FP8 kernels that require deep_gemm at runtime.
-        "deep_gemm",
     )
     .env({
         "HF_HOME": HF_HOME,
         "HF_HUB_ENABLE_HF_TRANSFER": "1",
+        # Disable DeepGEMM auto-selection + force FLASH_ATTN backend for Q3.6.
+        "VLLM_USE_DEEP_GEMM": "0",
+        "VLLM_ATTENTION_BACKEND": "FLASH_ATTN",
     })
     .pip_install("hf_transfer")
     .add_local_python_source("bird")
@@ -627,11 +634,14 @@ class AgentQ36:
         from bird.inference import VLLMEngine
 
         t0 = time.time()
+        # Q3.6 GDN requires max_num_batched_tokens=2096 + FLASH_ATTN.
         self.engine = VLLMEngine(
             model=self.model_name,
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             download_dir=HF_HOME,
+            max_num_batched_tokens=2096,
+            attention_backend="FLASH_ATTN",
         )
         print(f"[agent-q36] loaded {self.model_name} in {time.time() - t0:.1f}s")
 
@@ -786,11 +796,14 @@ class SamplerQ36:
         from bird.inference import VLLMEngine
 
         t0 = time.time()
+        # Q3.6 GDN requires max_num_batched_tokens=2096 + FLASH_ATTN.
         self.engine = VLLMEngine(
             model=self.model_name,
             tensor_parallel_size=self.tensor_parallel_size,
             max_model_len=self.max_model_len,
             download_dir=HF_HOME,
+            max_num_batched_tokens=2096,
+            attention_backend="FLASH_ATTN",
         )
         print(f"[sampler-q36] loaded {self.model_name} in {time.time() - t0:.1f}s")
 

@@ -40,21 +40,52 @@ class VLLMEngine:
         download_dir: str | None = None,
         trust_remote_code: bool = True,
         enforce_eager: bool = False,
+        max_num_batched_tokens: int | None = None,
+        attention_backend: str | None = None,
     ):
         from vllm import LLM  # noqa: WPS433  (lazy import on purpose)
 
         self.model = model
-        self._llm = LLM(
-            model=model,
-            tensor_parallel_size=tensor_parallel_size,
-            max_model_len=max_model_len,
-            gpu_memory_utilization=gpu_memory_utilization,
-            dtype=dtype,
-            enable_prefix_caching=enable_prefix_caching,
-            download_dir=download_dir,
-            trust_remote_code=trust_remote_code,
-            enforce_eager=enforce_eager,
-        )
+        extra_kwargs: dict = {}
+        if max_num_batched_tokens is not None:
+            # Q3.6 GDN cache alignment requires 2096; vLLM default 8192 silently breaks.
+            extra_kwargs["max_num_batched_tokens"] = max_num_batched_tokens
+        if attention_backend is not None:
+            # vllm 0.19 takes attention_backend at the LLM ctor; older versions
+            # would only honor the env var. We set both for safety.
+            extra_kwargs["attention_backend"] = attention_backend
+        try:
+            self._llm = LLM(
+                model=model,
+                tensor_parallel_size=tensor_parallel_size,
+                max_model_len=max_model_len,
+                gpu_memory_utilization=gpu_memory_utilization,
+                dtype=dtype,
+                enable_prefix_caching=enable_prefix_caching,
+                download_dir=download_dir,
+                trust_remote_code=trust_remote_code,
+                enforce_eager=enforce_eager,
+                **extra_kwargs,
+            )
+        except TypeError as e:
+            # If `attention_backend` isn't a valid LLM kwarg in this vllm
+            # version, fall back to env-var-only mode (already set in image).
+            if "attention_backend" in str(e):
+                extra_kwargs.pop("attention_backend", None)
+                self._llm = LLM(
+                    model=model,
+                    tensor_parallel_size=tensor_parallel_size,
+                    max_model_len=max_model_len,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    dtype=dtype,
+                    enable_prefix_caching=enable_prefix_caching,
+                    download_dir=download_dir,
+                    trust_remote_code=trust_remote_code,
+                    enforce_eager=enforce_eager,
+                    **extra_kwargs,
+                )
+            else:
+                raise
 
     def chat(self, conversations: Sequence[list[dict]], cfg: GenConfig) -> list[GenOutput]:
         """Run a batch of chat-message lists through vLLM.
