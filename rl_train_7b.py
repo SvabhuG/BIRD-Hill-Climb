@@ -134,8 +134,11 @@ def train_rl_7b(
     if smoke:
         num_examples = 20
         max_steps = 2
-        gradient_accumulation_steps = 2  # 2 prompts * 4 gens = 8 rollouts/step
-        print("[smoke] num_examples=20, max_steps=2, grad_accum=2")
+        # gen_batch_size = per_device_bs * world * grad_accum must be divisible
+        # by num_generations. With per_device_bs=1, world=1, grad_accum=4 → 4,
+        # divisible by num_generations=4.
+        gradient_accumulation_steps = 4
+        print("[smoke] num_examples=20, max_steps=2, grad_accum=4")
 
     sft_checkpoints.reload()
     bird_data.reload()
@@ -319,13 +322,14 @@ def train_rl_7b(
     )
 
     # ---- 5. GRPO config ----
+    # NOTE: recent TRL (>=0.20) dropped `max_prompt_length` from GRPOConfig.
+    # We enforce the prompt cap upstream when building the dataset (lines above).
     grpo_args = GRPOConfig(
         output_dir=output_dir,
         per_device_train_batch_size=per_device_train_batch_size,
         gradient_accumulation_steps=gradient_accumulation_steps,
         learning_rate=learning_rate,
         num_generations=num_generations,
-        max_prompt_length=max_prompt_length,
         max_completion_length=max_completion_length,
         max_steps=max_steps,
         logging_steps=1,
